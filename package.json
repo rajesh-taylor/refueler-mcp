@@ -22,7 +22,8 @@
     "test": "node --test test/hmac.test.js test/capabilities.test.js"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0"
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@noble/hashes": "^2.4.0"
   },
   "keywords": [
     "refueler",
