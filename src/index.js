@@ -1,192 +1,114 @@
-// src/index.js — refueler-mcp
-// MCP server entry point. stdio transport.
-// Tools: refueler_capabilities, refueler_quote, refueler_balance
-//
-// SW-MCP-1: scaffold + capabilities
-// SW-MCP-2: crypto.js + fragment.js (no index changes)
-// SW-MCP-3: quote + balance wired here
+/**
+ * refueler-mcp/src/index.js — MCP server entry point
+ *
+ * Tools registered (SW-MCP-1 through SW-MCP-5):
+ *   refueler_capabilities  — SW-MCP-1
+ *   refueler_quote         — SW-MCP-3
+ *   refueler_balance       — SW-MCP-3
+ *   refueler_send_file     — SW-MCP-4
+ *   refueler_check_transfer — SW-MCP-5
+ *
+ * Full path: /Users/rajeshtaylor/Documents/refueler-mcp/src/index.js
+ * NOT refueler-share/worker/src/index.js — different repo entirely.
+ */
 
 'use strict';
 
-import { loadConfig } from './config.js';
-import { makeApiClient } from './api.js';
-import { capabilitiesTool } from './tools/capabilities.js';
-import { quoteTool } from './tools/quote.js';
-import { balanceTool } from './tools/balance.js';
-import { sendFileTool, handleSendFile } from './tools/send.js';
+import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import {
+  ListToolsRequestSchema,
+  CallToolRequestSchema,
+} from '@modelcontextprotocol/sdk/types.js';
 
-// ---------------------------------------------------------------------------
-// Tool registry
-// ---------------------------------------------------------------------------
+import { ApiClient } from './api-client.js';
+import { signRequest } from './hmac.js';
+
+// ── Tool definitions + handlers ──────────────────────────────────────────────
+
+import {
+  CAPABILITIES_TOOL_DEFINITION,
+  handleCapabilities,
+} from './tools/capabilities.js';
+
+import {
+  QUOTE_TOOL_DEFINITION,
+  handleQuote,
+} from './tools/quote.js';
+
+import {
+  BALANCE_TOOL_DEFINITION,
+  handleBalance,
+} from './tools/balance.js';
+
+import {
+  SEND_FILE_TOOL_DEFINITION,
+  handleSendFile,
+} from './tools/send.js';
+
+import {
+  CHECK_TOOL_DEFINITION,
+  handleCheckTransfer,
+} from './tools/check.js';
+
+// ── Tool registry ─────────────────────────────────────────────────────────────
 
 const TOOLS = [
-  capabilitiesTool,
-  quoteTool,
-  balanceTool,
-  sendFileTool,
+  CAPABILITIES_TOOL_DEFINITION,
+  QUOTE_TOOL_DEFINITION,
+  BALANCE_TOOL_DEFINITION,
+  SEND_FILE_TOOL_DEFINITION,
+  CHECK_TOOL_DEFINITION,
 ];
 
-// Build a lookup map: tool name → descriptor
-const TOOL_MAP = Object.fromEntries(TOOLS.map((t) => [t.name, t]));
+// ── Config ────────────────────────────────────────────────────────────────────
 
-// ---------------------------------------------------------------------------
-// MCP protocol helpers (stdio, newline-delimited JSON)
-// ---------------------------------------------------------------------------
+const BASE_URL = process.env.REFUELER_API_URL ?? 'https://api.share.refueler.io';
+const LIVE_KEY = process.env.REFUELER_LIVE_KEY ?? '';
+const SIGN_KEY = process.env.REFUELER_SIGN_KEY ?? '';
 
-function sendMessage(msg) {
-  process.stdout.write(JSON.stringify(msg) + '\n');
-}
+// ── Server bootstrap ──────────────────────────────────────────────────────────
 
-function sendError(id, code, message) {
-  sendMessage({
-    jsonrpc: '2.0',
-    id,
-    error: { code, message },
-  });
-}
+const server = new Server(
+  { name: 'refueler-mcp', version: '0.5.0' },
+  { capabilities: { tools: {} } },
+);
 
-// ---------------------------------------------------------------------------
-// Request handlers
-// ---------------------------------------------------------------------------
+const client = new ApiClient({ baseUrl: BASE_URL, liveKey: LIVE_KEY, signKey: SIGN_KEY, signRequest });
 
-function handleInitialize(id) {
-  sendMessage({
-    jsonrpc: '2.0',
-    id,
-    result: {
-      protocolVersion: '2024-11-05',
-      capabilities: { tools: {} },
-      serverInfo: {
-        name: 'refueler-mcp',
-        version: '0.3.0',
-      },
-    },
-  });
-}
+// ── List tools ────────────────────────────────────────────────────────────────
 
-function handleToolsList(id) {
-  const tools = TOOLS.map((t) => ({
-    name: t.name,
-    description: t.description,
-    inputSchema: t.inputSchema,
-  }));
-  sendMessage({ jsonrpc: '2.0', id, result: { tools } });
-}
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: TOOLS,
+}));
 
-async function handleToolCall(id, params, ctx) {
-  const { name, arguments: args } = params ?? {};
+// ── Call tool ─────────────────────────────────────────────────────────────────
 
-  const tool = TOOL_MAP[name];
-  if (!tool) {
-    sendError(id, -32601, `Unknown tool: ${name}`);
-    return;
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const { name, arguments: args } = request.params;
+
+  switch (name) {
+    case 'refueler_capabilities':
+      return { content: await handleCapabilities(args, client) };
+
+    case 'refueler_quote':
+      return { content: await handleQuote(args, client) };
+
+    case 'refueler_balance':
+      return { content: await handleBalance(args, client) };
+
+    case 'refueler_send_file':
+      return { content: await handleSendFile(args, client) };
+
+    case 'refueler_check_transfer':
+      return { content: await handleCheckTransfer(args, client) };
+
+    default:
+      throw new Error(`Unknown tool: ${name}`);
   }
-
-  let result;
-  try {
-    result = await tool.handler(args ?? {}, ctx);
-  } catch (err) {
-    sendError(id, -32603, err?.message ?? 'Internal tool error');
-    return;
-  }
-
-  sendMessage({
-    jsonrpc: '2.0',
-    id,
-    result: {
-      content: [
-        {
-          type: 'text',
-          text: JSON.stringify(result, null, 2),
-        },
-      ],
-    },
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Main loop
-// ---------------------------------------------------------------------------
-
-async function main() {
-  let config;
-  try {
-    config = await loadConfig();
-  } catch (err) {
-    process.stderr.write(`[refueler-mcp] Config error: ${err.message}\n`);
-    process.exit(1);
-  }
-
-  const api = makeApiClient(config);
-  const ctx = { api, config };
-
-  // Accumulate partial lines from stdin
-  let buffer = '';
-
-  process.stdin.setEncoding('utf8');
-
-  process.stdin.on('data', async (chunk) => {
-    buffer += chunk;
-    const lines = buffer.split('\n');
-    buffer = lines.pop(); // keep the (possibly partial) last line
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-
-      let msg;
-      try {
-        msg = JSON.parse(trimmed);
-      } catch {
-        // Malformed JSON — log and continue; no id to reply with
-        process.stderr.write(`[refueler-mcp] JSON parse error: ${trimmed}\n`);
-        continue;
-      }
-
-      const { jsonrpc, id, method, params } = msg;
-
-      if (jsonrpc !== '2.0') {
-        sendError(id ?? null, -32600, 'Invalid JSON-RPC version');
-        continue;
-      }
-
-      switch (method) {
-        case 'initialize':
-          handleInitialize(id);
-          break;
-
-        case 'notifications/initialized':
-          // Acknowledgement — no response required.
-          break;
-
-        case 'tools/list':
-          handleToolsList(id);
-          break;
-
-        case 'tools/call':
-          await handleToolCall(id, params, ctx);
-          break;
-
-        case 'ping':
-          sendMessage({ jsonrpc: '2.0', id, result: {} });
-          break;
-
-        default:
-          sendError(id, -32601, `Method not found: ${method}`);
-      }
-    }
-  });
-
-  process.stdin.on('end', () => {
-    process.exit(0);
-  });
-
-  // Degrade-mode cache: if capabilities has been loaded into config
-  // (e.g. pre-fetched at startup), it is available via config.capabilities.
-  // Capabilities tool handles its own staleness logic.
-}
-
-main().catch((err) => {
-  process.stderr.write(`[refueler-mcp] Fatal: ${err.message}\n`);
-  process.exit(1);
 });
+
+// ── Start ─────────────────────────────────────────────────────────────────────
+
+const transport = new StdioServerTransport();
+await server.connect(transport);

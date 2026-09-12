@@ -15,6 +15,7 @@
 
 import { randomFillSync } from 'node:crypto';
 import { stat } from 'node:fs/promises';
+import path from 'node:path';
 import {
   generateAesKey,
   encryptChunk,
@@ -155,8 +156,14 @@ export async function handleSendFile(input, { apiClient, config, capabilities })
 
   // ── 0. Validate file exists ──────────────────────────────────────────────
   let fileStat;
+  // ── path traversal guard — reject ../../etc/passwd style injection ───────
+  const resolvedPath = path.resolve(file_path);
+  if (file_path.split(path.sep).some(seg => seg === '..')) {
+    return _err(`File path contains traversal sequence: ${file_path}`);
+  }
+
   try {
-    fileStat = await stat(file_path);
+    fileStat = await stat(resolvedPath);
     if (!fileStat.isFile()) {
       return _err(`Not a regular file: ${file_path}`);
     }
@@ -186,7 +193,7 @@ export async function handleSendFile(input, { apiClient, config, capabilities })
   const encryptedChunks  = [];
   const chunkHashes      = [];
 
-  for await (const { index, buffer } of chunkFile(file_path, DEFAULT_CHUNK_SIZE)) {
+    for await (const { index, buffer } of chunkFile(resolvedPath, DEFAULT_CHUNK_SIZE)) {
     const ciphertext = await encryptChunk(keyBytes, index, buffer);
     encryptedChunks.push(ciphertext);
     chunkHashes.push(blake3Chunk(ciphertext));
