@@ -1,0 +1,7 @@
+Refueler Share lets you transfer files to anyone without creating an account, entering
+an email address, or trusting a third party with your documents. Files are encrypted
+in your browser before they leave your device — the server receives sealed ciphertext
+and nothing else. Access is gated by Bitcoin-native cryptographic tokens: the server
+cannot open what it stores, cannot see who sent it, and cannot see who collected it.
+When the transfer expires, it is struck off permanently. This is what private file
+transfer looks like when it is built on Bitcoin from the ground up.
