@@ -1,105 +1,187 @@
-#!/usr/bin/env node
-/**
- * src/index.js — Refueler Share MCP server
- *
- * Privacy-first, encrypted file transfer for agents.
- * Runs in the agent's trust domain — Refueler never hosts this server.
- *
- * Transport: stdio (MCP standard)
- * Launch:    npx @refueler/mcp-server
- *            node src/index.js
- *
- * Required env:  REFUELER_LIVE_KEY, REFUELER_SIGN_KEY
- * Optional env:  REFUELER_API_BASE, REFUELER_RAIL, REFUELER_ANON_CREDITS
- */
+// src/index.js — refueler-mcp
+// MCP server entry point. stdio transport.
+// Tools: refueler_capabilities, refueler_quote, refueler_balance
+//
+// SW-MCP-1: scaffold + capabilities
+// SW-MCP-2: crypto.js + fragment.js (no index changes)
+// SW-MCP-3: quote + balance wired here
 
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-} from '@modelcontextprotocol/sdk/types.js';
+'use strict';
 
 import { loadConfig } from './config.js';
-import { createApiClient } from './api.js';
-import { capabilitiesTool, handleCapabilities } from './tools/capabilities.js';
-
-// ---------------------------------------------------------------------------
-// Boot
-// ---------------------------------------------------------------------------
-
-let config;
-try {
-  config = loadConfig();
-} catch (err) {
-  process.stderr.write(`[refueler-mcp] Fatal: ${err.message}\n`);
-  process.exit(1);
-}
-
-const apiClient = createApiClient(config);
-
-// ---------------------------------------------------------------------------
-// Server
-// ---------------------------------------------------------------------------
-
-const server = new Server(
-  {
-    name: '@refueler/mcp-server',
-    version: '0.1.0',
-  },
-  {
-    capabilities: {
-      tools: {},
-    },
-  }
-);
+import { makeApiClient } from './api.js';
+import { capabilitiesTool } from './tools/capabilities.js';
+import { quoteTool } from './tools/quote.js';
+import { balanceTool } from './tools/balance.js';
 
 // ---------------------------------------------------------------------------
 // Tool registry
-// SW-MCP-1: capabilities only.
-// SW-MCP-3: refueler_quote + refueler_balance
-// SW-MCP-4: refueler_send_file
-// SW-MCP-5: refueler_check_transfer
 // ---------------------------------------------------------------------------
 
-const TOOLS = [capabilitiesTool];
+const TOOLS = [
+  capabilitiesTool,
+  quoteTool,
+  balanceTool,
+];
 
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return { tools: TOOLS };
-});
+// Build a lookup map: tool name → descriptor
+const TOOL_MAP = Object.fromEntries(TOOLS.map((t) => [t.name, t]));
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
+// ---------------------------------------------------------------------------
+// MCP protocol helpers (stdio, newline-delimited JSON)
+// ---------------------------------------------------------------------------
 
-  switch (name) {
-    case 'refueler_capabilities':
-      return handleCapabilities(args ?? {}, apiClient);
+function sendMessage(msg) {
+  process.stdout.write(JSON.stringify(msg) + '\n');
+}
 
-    default:
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({
-              error: 'unknown_tool',
-              detail: `Tool "${name}" is not available in this version of @refueler/mcp-server.`,
-            }),
-          },
-        ],
-        isError: true,
-      };
+function sendError(id, code, message) {
+  sendMessage({
+    jsonrpc: '2.0',
+    id,
+    error: { code, message },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Request handlers
+// ---------------------------------------------------------------------------
+
+function handleInitialize(id) {
+  sendMessage({
+    jsonrpc: '2.0',
+    id,
+    result: {
+      protocolVersion: '2024-11-05',
+      capabilities: { tools: {} },
+      serverInfo: {
+        name: 'refueler-mcp',
+        version: '0.3.0',
+      },
+    },
+  });
+}
+
+function handleToolsList(id) {
+  const tools = TOOLS.map((t) => ({
+    name: t.name,
+    description: t.description,
+    inputSchema: t.inputSchema,
+  }));
+  sendMessage({ jsonrpc: '2.0', id, result: { tools } });
+}
+
+async function handleToolCall(id, params, ctx) {
+  const { name, arguments: args } = params ?? {};
+
+  const tool = TOOL_MAP[name];
+  if (!tool) {
+    sendError(id, -32601, `Unknown tool: ${name}`);
+    return;
   }
-});
+
+  let result;
+  try {
+    result = await tool.handler(args ?? {}, ctx);
+  } catch (err) {
+    sendError(id, -32603, err?.message ?? 'Internal tool error');
+    return;
+  }
+
+  sendMessage({
+    jsonrpc: '2.0',
+    id,
+    result: {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(result, null, 2),
+        },
+      ],
+    },
+  });
+}
 
 // ---------------------------------------------------------------------------
-// Transport
+// Main loop
 // ---------------------------------------------------------------------------
-
-const transport = new StdioServerTransport();
 
 async function main() {
-  await server.connect(transport);
-  process.stderr.write('[refueler-mcp] Server running on stdio. Rail: ' + config.rail + '\n');
+  let config;
+  try {
+    config = await loadConfig();
+  } catch (err) {
+    process.stderr.write(`[refueler-mcp] Config error: ${err.message}\n`);
+    process.exit(1);
+  }
+
+  const api = makeApiClient(config);
+  const ctx = { api, config };
+
+  // Accumulate partial lines from stdin
+  let buffer = '';
+
+  process.stdin.setEncoding('utf8');
+
+  process.stdin.on('data', async (chunk) => {
+    buffer += chunk;
+    const lines = buffer.split('\n');
+    buffer = lines.pop(); // keep the (possibly partial) last line
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+
+      let msg;
+      try {
+        msg = JSON.parse(trimmed);
+      } catch {
+        // Malformed JSON — log and continue; no id to reply with
+        process.stderr.write(`[refueler-mcp] JSON parse error: ${trimmed}\n`);
+        continue;
+      }
+
+      const { jsonrpc, id, method, params } = msg;
+
+      if (jsonrpc !== '2.0') {
+        sendError(id ?? null, -32600, 'Invalid JSON-RPC version');
+        continue;
+      }
+
+      switch (method) {
+        case 'initialize':
+          handleInitialize(id);
+          break;
+
+        case 'notifications/initialized':
+          // Acknowledgement — no response required.
+          break;
+
+        case 'tools/list':
+          handleToolsList(id);
+          break;
+
+        case 'tools/call':
+          await handleToolCall(id, params, ctx);
+          break;
+
+        case 'ping':
+          sendMessage({ jsonrpc: '2.0', id, result: {} });
+          break;
+
+        default:
+          sendError(id, -32601, `Method not found: ${method}`);
+      }
+    }
+  });
+
+  process.stdin.on('end', () => {
+    process.exit(0);
+  });
+
+  // Degrade-mode cache: if capabilities has been loaded into config
+  // (e.g. pre-fetched at startup), it is available via config.capabilities.
+  // Capabilities tool handles its own staleness logic.
 }
 
 main().catch((err) => {
