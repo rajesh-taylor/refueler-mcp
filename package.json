@@ -1,0 +1,41 @@
+{
+  "name": "@refueler/mcp-server",
+  "version": "0.1.0",
+  "description": "Refueler Share MCP server — privacy-first encrypted file transfer for agents",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "main": "src/index.js",
+  "bin": {
+    "refueler-mcp-server": "src/index.js"
+  },
+  "files": [
+    "src/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node src/index.js",
+    "check": "node --check src/index.js && node --check src/hmac.js && node --check src/api.js && node --check src/tools/capabilities.js && node --check src/config.js",
+    "test": "node --test test/hmac.test.js test/capabilities.test.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "keywords": [
+    "refueler",
+    "mcp",
+    "file-transfer",
+    "privacy",
+    "bitcoin",
+    "cashu",
+    "encryption"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rajesh-taylor/refueler-mcp"
+  },
+  "homepage": "https://refueler.io/share/"
+}

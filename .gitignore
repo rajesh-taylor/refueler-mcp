@@ -1,0 +1,21 @@
+node_modules/
+.env
+.env.*
+*.local
+
+# Never commit credential files — operator places config manually
+# (rfs_live_*, rfs_sign_*, rfs_anon_credits.json, etc.)
+rfs_*.json
+rfs_*.txt
+credits.json
+anon_credits.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
