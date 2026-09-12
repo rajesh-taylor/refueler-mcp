@@ -14,7 +14,7 @@
 import { randomFillSync } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { stat } from 'node:fs/promises';
-import { blake3 } from '@noble/hashes/blake3';
+import { blake3 } from '@noble/hashes/blake3.js';
 
 // ---------------------------------------------------------------------------
 // Constants
