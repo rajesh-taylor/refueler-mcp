@@ -13,6 +13,7 @@ import { makeApiClient } from './api.js';
 import { capabilitiesTool } from './tools/capabilities.js';
 import { quoteTool } from './tools/quote.js';
 import { balanceTool } from './tools/balance.js';
+import { sendFileTool, handleSendFile } from './tools/send.js';
 
 // ---------------------------------------------------------------------------
 // Tool registry
@@ -22,6 +23,7 @@ const TOOLS = [
   capabilitiesTool,
   quoteTool,
   balanceTool,
+  sendFileTool,
 ];
 
 // Build a lookup map: tool name → descriptor
