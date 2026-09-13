@@ -1,131 +1,171 @@
 # @refueler/mcp-server
 
-**Refueler Share — privacy-first encrypted file transfer for AI agents.**
-
-> Refueler Share gives an agent a privacy-first file-transfer capability that runs
-> entirely in the agent's own trust domain: files are chunked, encrypted, and
-> BLAKE3-hashed locally before anything touches the network, so the Refueler Worker
-> relays ciphertext it cannot read and — on the anonymous rail — cannot tie to an
-> identity. The v1 toolset lets an agent price a transfer, send a file to any
-> recipient with a browser, and pull a signed collection receipt when it's collected,
-> paying from a prepaid pool of Share credits. You run the server yourself — it's an
-> open-source npm package under Apache 2.0, so your team can audit exactly what it
-> does, and Refueler never sees your keys or your plaintext.
+[![npm](https://img.shields.io/npm/v/@refueler/mcp-server)](https://www.npmjs.com/package/@refueler/mcp-server)
+[![Apache 2.0](https://img.shields.io/badge/licence-Apache_2.0-blue)](./LICENSE)
 
 ---
 
-## Architecture — trust boundary
+## What this is
 
-**This server runs in your infrastructure, not Refueler's.**
+An MCP server that runs in your own infrastructure and gives an AI agent a
+privacy-first file-transfer capability backed by Refueler Share. The server
+handles local encryption, BLAKE3 chunk integrity, and upload orchestration;
+the Refueler Worker relays the resulting ciphertext to R2 storage without
+being able to read it. Four tools ship in v0.1: `refueler_capabilities`,
+`refueler_quote`, `refueler_send_file`, and `refueler_check_transfer`. The
+identity rail — HMAC-authenticated, credit-pool-funded — is live and
+demoable today. The anonymous rail, which settles transfers over Lightning
+with no identity at all, gates on the B7 infrastructure milestone and is not
+in this release.
 
-That is the point. Encryption happens inside this process, in your trust domain.
-The Refueler Worker receives ciphertext it cannot read. On the anonymous rail, it
-cannot tie a transfer to an identity. Refueler never sees your keys, your
-plaintext, or — on the anonymous rail — who you are.
+---
 
-Do not let a third party host this server on your behalf. The trust model only
-holds if the MCP server runs inside the same trust boundary as your agent.
+## Trust boundary
+
+This is the section that matters. Read it once; it decides whether this
+product is right for your threat model.
+
+**What the server does in your infrastructure**
+
+- Chunks and encrypts files locally using AES-256-GCM before anything
+  leaves the process. The session key lives in the returned `share_url`
+  fragment only — it is never transmitted to the Refueler Worker, never
+  written to a log, never present in any request.
+- Computes a BLAKE3 integrity hash over each ciphertext chunk and verifies
+  it on the Worker's behalf. The Worker rejects any chunk whose hash does
+  not match.
+- Holds your API credentials (`rfs_live_`, `rfs_sign_`) locally, in your
+  environment. They are used to sign HMAC-SHA256 requests outbound to the
+  Refueler API. They never leave your infrastructure in any request payload.
+- On the anonymous rail (B7): holds a local stack of blind-signed capability
+  tokens. The balance is your local state — Refueler's server is blind to it.
+
+**What the Refueler Worker sees**
+
+- Ciphertext chunks and their BLAKE3 hashes.
+- Byte counts, UUID, credential commitment, and expiry.
+- The declared Content-Type at the upload boundary, checked against an
+  execution-capable denylist and not stored.
+- On the identity rail: your `rfs_live_` handle and an optional
+  `transfer_ref` you supply for your own attribution. No plaintext.
+  No key. No passphrase.
+
+**What the Refueler Worker never sees**
+
+- Plaintext bytes. The Worker is a blind byte-relay; it physically cannot
+  produce your file content under compulsion because it never held the key.
+- The AES-256-GCM session key.
+- The passphrase, if set. The Worker receives only a SHA-256 hash of the
+  passphrase — not the passphrase itself.
+- The filename. From SW-MCP-4 onward, the filename travels in the URL
+  fragment alongside the session key, never in any request. Until that
+  release, the filename is present in the upload manifest — scope your trust
+  claims accordingly.
+- On the anonymous rail: any identity, email address, or Supabase row. The
+  anonymous rail has no identity by architectural construction, not policy.
+
+**What "chunk integrity" means, and what it does not**
+
+Per-chunk BLAKE3 verification is live: the Worker rejects tampered or
+corrupted individual chunks at upload. Full Merkle-root verification —
+where the Worker reconstructs the complete ciphertext Merkle tree on
+download and compares it against the root committed at upload — is
+in build (B9) and not yet live. Until B9-3 ships, the correct claim is
+"chunk integrity," not "ciphertext storage integrity" and not
+"end-to-end file integrity." The recipient's browser verifies the
+full plaintext BLAKE3 root on their side; that is the end-to-end check.
+It does not pass through this server.
+
+**The server runs in your infrastructure.** Refueler has no visibility
+into your MCP server process, your credential store, or your agent's
+conversation history. If your security model requires an audit,
+the full source is on GitHub under Apache 2.0.
 
 ---
 
 ## Requirements
 
-- Node.js ≥ 20
-- A Refueler Share API credential pair (identity rail)
-- `npx @refueler/mcp-server` or `node src/index.js`
+- Node.js ≥ 18
+- Credentials from `refueler.io/share/` — you need two keys per
+  credential relationship:
+  - `rfs_live_…` — identifies the API relationship
+  - `rfs_sign_…` — signs outbound requests (HMAC-SHA256)
+- Optional: `rfs_whsec_…` — webhook signing verification (Chartered /
+  identity-API tier only)
+
+Environment variable names:
+
+```
+REFUELER_LIVE_KEY=rfs_live_…
+REFUELER_SIGN_KEY=rfs_sign_…
+REFUELER_WHSEC_KEY=rfs_whsec_…   # optional; Chartered tier only
+REFUELER_API_BASE=https://api.share.refueler.io
+```
+
+Use a `.env` file for local development or a secrets manager for
+production. Never commit key values to version control — the `rfs_live_`
+and `rfs_sign_` prefixes are pattern-matched by common secret scanners.
 
 ---
 
-## Configuration
-
-All configuration is via environment variables. **Never put credential values in a
-file that could be committed to git or shared accidentally.**
-
-Place your credentials in your system's secrets manager, your CI environment, or a
-`.env` file that is listed in `.gitignore` and never committed.
-
-| Variable | Required | Description |
-|---|---|---|
-| `REFUELER_LIVE_KEY` | ✅ | `rfs_live_...` identification key from your Refueler dashboard |
-| `REFUELER_SIGN_KEY` | ✅ | `rfs_sign_...` request-signing key from your Refueler dashboard |
-| `REFUELER_API_BASE` | — | Defaults to `https://api.share.refueler.io` |
-| `REFUELER_RAIL` | — | `identity` (default) or `anonymous` (see below) |
-| `REFUELER_ANON_CREDITS` | — | Local path to anonymous credit stack JSON (anonymous rail, coming in a future release) |
-
-**Credential files are never copied by an automation tool.** Place them manually.
-This is not a workflow limitation — it is a security invariant. The server must never
-be able to exfiltrate its own credentials via an automated command.
-
----
-
-## Quick start
+## Install
 
 ```bash
-npm install -g @refueler/mcp-server
-
-export REFUELER_LIVE_KEY=rfs_live_...
-export REFUELER_SIGN_KEY=rfs_sign_...
-
-npx @refueler/mcp-server
+npm install @refueler/mcp-server
 ```
 
-Or add to your MCP client config:
-
-```json
-{
-  "mcpServers": {
-    "refueler": {
-      "command": "npx",
-      "args": ["@refueler/mcp-server"],
-      "env": {
-        "REFUELER_LIVE_KEY": "rfs_live_...",
-        "REFUELER_SIGN_KEY": "rfs_sign_..."
-      }
-    }
-  }
-}
-```
+Add to your MCP host configuration — the exact method depends on your
+agent framework. The server expects credentials via environment variables
+or a `.env` file in the working directory. You manage your own config;
+no credentials are ever pulled from a remote source by this package.
 
 ---
 
-## Tools (v1)
+## Tools
 
-| Tool | Status | Description |
-|---|---|---|
-| `refueler_capabilities` | ✅ Live | Fetch service capabilities and rate card. Silent preflight. |
-| `refueler_quote` | 🔜 SW-MCP-3 | Price a transfer before spending anything. |
-| `refueler_balance` | 🔜 SW-MCP-3 | Check your credit pool balance. |
-| `refueler_send_file` | 🔜 SW-MCP-4 | Encrypt locally and lodge a file. Returns a share URL. |
-| `refueler_check_transfer` | 🔜 SW-MCP-5 | Pull acceptance and collection receipts. |
+**`refueler_capabilities`** — discover the live feature set and rate card.
+Unauthenticated, free, called automatically before any send. The agent
+will not offer features the server cannot honour.
 
-**What ships in v1:** the send path, honestly scoped. Standing agent-to-agent inboxes
-and inline Lightning payment are on the roadmap, not in this release.
+**`refueler_quote`** — price a transfer before committing. Returns cost in
+Share credits, your remaining balance, and whether the transfer would exceed
+your allocation. No spend occurs.
 
----
+**`refueler_send_file`** — encrypt and send a file. Chunks, encrypts, and
+BLAKE3-hashes locally; uploads ciphertext to R2; returns a `share_url` with
+the session key in the fragment. Accepts an optional passphrase for a second
+access factor. Deducts credits from your pool on issuance.
 
-## Rails
+**`refueler_check_transfer`** — pull a signed receipt. Acceptance receipt is
+available immediately after upload. Collection receipt is available once the
+recipient has downloaded. These are collection receipts — they confirm
+collection, not delivery; delivery to a specific person is not something the
+server can verify.
 
-### Identity rail (available now)
-Stripe-billed, server-held credit pool. Monthly allocation. Metered overage up to a
-ceiling (API tier). Hard stop at allocation (Personal API). Recoverable, invoiceable,
-auditable. The demoable rail today.
+**Gates on B7:** Anonymous-rail sends — where no identity is associated with
+the transfer and credits settle over Lightning — require the B7/NB-4
+Lightning infrastructure milestone. The tool is present in v0.1 but the
+anonymous rail is not available until that milestone lands.
 
-### Anonymous rail (coming — gates on B7/NB-4)
-Client-held bearer credits stored locally in the agent's trust domain. Topped up via
-Lightning. The server is blind to the balance. Non-recoverable. Set
-`REFUELER_RAIL=anonymous` and `REFUELER_ANON_CREDITS` to the local credit stack path.
-**Not functional in this release.**
+**Gates on Silent Drop:** `refueler_receive` — a standing agent-to-agent
+inbox — is not in v0.1. A recipient in v0.1 collects via a browser link.
 
 ---
 
 ## Licence
 
-Apache 2.0. Patent grant clause protects the BLAKE3 + Cashu combination.
+Apache 2.0. The patent grant clause in §3 of the Apache licence covers
+the BLAKE3 + Cashu combination used in this server and in the Refueler
+Worker, so you can build on it without worrying about downstream patent risk
+from that pairing.
 
 ---
 
-## Links
+## Roadmap
 
-- [Refueler Share](https://refueler.io/share/)
-- [API documentation](https://refueler.io/share/)
-- [GitHub](https://github.com/rajesh-taylor/refueler-mcp)
+- **Anonymous rail (B7):** Lightning-settled transfers with no identity
+  required — credits purchased over BOLT11, stored locally, spent per send.
+- **Silent Drop standing inbox (SD-block):** `refueler_receive` — publish
+  a receiving address; senders lodge ciphertext without a prior link exchange.
+- **Inline Lightning payment (B9+):** the agent prices a transfer, pays
+  inline in the same tool call, and sends — no separate top-up step.

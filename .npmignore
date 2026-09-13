@@ -1,0 +1,34 @@
+# Tests
+test/
+*.test.js
+*.spec.js
+vitest.config.*
+
+# Scripts
+scripts/
+bin/
+
+# Docs
+docs/
+
+# Secrets
+.env
+.env.*
+*.env
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+
+# CI
+.github/
+
+# Coverage
+coverage/
+
+# Context files
+CLAUDE.md
+REFUELER-BRIDGE.md
+refueler-mcp-spec-v2.md
+PARITY.md

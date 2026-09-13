@@ -1,42 +1,50 @@
 {
   "name": "@refueler/mcp-server",
   "version": "0.1.0",
-  "description": "Refueler Share MCP server — privacy-first encrypted file transfer for agents",
+  "description": "Refueler Share MCP server — privacy-first file transfer in the agent's own trust domain",
   "license": "Apache-2.0",
-  "type": "module",
-  "engines": {
-    "node": ">=20.0.0"
-  },
+  "private": false,
   "main": "src/index.js",
   "bin": {
-    "refueler-mcp-server": "src/index.js"
+    "refueler-mcp": "src/index.js"
+  },
+  "engines": {
+    "node": ">=18"
   },
   "files": [
     "src/",
     "README.md",
     "LICENSE"
   ],
-  "scripts": {
-    "start": "node src/index.js",
-    "check": "node --check src/index.js && node --check src/hmac.js && node --check src/api.js && node --check src/tools/capabilities.js && node --check src/config.js",
-    "test": "node --test test/hmac.test.js test/capabilities.test.js"
-  },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0",
-    "@noble/hashes": "^2.4.0"
-  },
   "keywords": [
-    "refueler",
     "mcp",
+    "refueler",
     "file-transfer",
-    "privacy",
     "bitcoin",
     "cashu",
-    "encryption"
+    "lightning",
+    "privacy",
+    "blake3",
+    "encrypted"
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/rajesh-taylor/refueler-mcp"
+    "url": "https://github.com/rajesh-taylor/refueler-mcp.git"
   },
-  "homepage": "https://refueler.io/share/"
+  "homepage": "https://refueler.io/share/",
+  "bugs": {
+    "url": "https://github.com/rajesh-taylor/refueler-mcp/issues"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.30.0",
+    "@noble/hashes": "^1.4.0",
+    "@noble/secp256k1": "^2.1.0",
+    "dotenv": "^16.4.0"
+  },
+  "devDependencies": {
+    "vitest": "^2.0.0"
+  },
+  "scripts": {
+    "test": "vitest run"
+  }
 }
