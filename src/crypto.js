@@ -296,3 +296,190 @@ export async function hashSecret(passphrase) {
     .map(b => b.toString(16).padStart(2, '0'))
     .join('');
 }
+
+// =============================================================================
+// B8-1 — NUT-11 Mode 2 (Locke) pure functions — MCP in-process sign side
+//
+// Full repo path: refueler-mcp/src/crypto.js
+// DO NOT confuse with worker/src/locke.js (verify side) or worker/src/nut11.js.
+//
+// hashSecret() above is UNTOUCHED. It is Mode 1 (bare SHA-256 of passphrase).
+// These are a NEW, SEPARATE surface. No collision with Mode 1.
+//
+// Parity: worker/src/locke.js (verify) ↔ frontend/crypto.js (sign) ↔ this file (sign)
+//
+// Requires these packages — already present in refueler-mcp:
+//   @noble/curves/secp256k1  → schnorr, secp256k1
+//   @noble/hashes/sha2       → sha256, sha512
+//   @noble/hashes/hkdf       → hkdf
+//   @noble/hashes/pbkdf2     → pbkdf2
+// =============================================================================
+
+import { schnorr, secp256k1 } from '@noble/curves/secp256k1.js';
+import { sha256, sha512 } from '@noble/hashes/sha2.js';
+import { hkdf } from '@noble/hashes/hkdf.js';
+import { pbkdf2 } from '@noble/hashes/pbkdf2.js';
+
+// ---------------------------------------------------------------------------
+// Locke constants (must match worker/src/locke.js exactly)
+// ---------------------------------------------------------------------------
+
+const _MCP_N = BigInt(
+  '0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141'
+);
+const _MCP_LOCKE_HKDF_SALT = new TextEncoder().encode('refueler.locke.v1');
+const _MCP_LOCKE_INFO_BASE  = 'locke_keypair';
+const _MCP_DOMAIN_LOGIN     = 'refueler.locke.login.v1';
+const _MCP_DOMAIN_AUTHORISE = 'refueler.locke.authorise.v1';
+const _MCP_DOMAIN_REVOKE    = 'refueler.locke.revoke.v1';
+
+// ---------------------------------------------------------------------------
+// deriveLockeFromDeed
+//
+// BIP-39 mnemonic → secp256k1 keypair via HKDF (B8-Opus D-1).
+// Locke key lives in agent process memory only — no Keychain, no WebAuthn-PRF.
+// Never persisted. Never logged. Caller is responsible for zeroing after use.
+//
+// @param {string} mnemonic
+// @returns {{ privateKey: Uint8Array, publicKey: Uint8Array }}
+// ---------------------------------------------------------------------------
+export function deriveLockeFromDeed(mnemonic) {
+  if (typeof mnemonic !== 'string' || !mnemonic.trim()) {
+    throw new TypeError('deriveLockeFromDeed: mnemonic must be a non-empty string');
+  }
+
+  const mnemonicBytes = new TextEncoder().encode(mnemonic.normalize('NFKD'));
+  const saltBytes     = new TextEncoder().encode('mnemonic'); // BIP-39 passphrase = ""
+  const seed = pbkdf2(sha512, mnemonicBytes, saltBytes, { c: 2048, dkLen: 64 });
+
+  let counter = 0;
+  while (true) {
+    const info = counter === 0 ? _MCP_LOCKE_INFO_BASE : `${_MCP_LOCKE_INFO_BASE}.${counter}`;
+    const okm  = hkdf(sha256, seed, _MCP_LOCKE_HKDF_SALT, new TextEncoder().encode(info), 32);
+
+    let d = BigInt(0);
+    for (const byte of okm) { d = (d << BigInt(8)) | BigInt(byte); }
+
+    if (d >= BigInt(1) && d < _MCP_N) {
+      return {
+        privateKey: okm,
+        publicKey:  secp256k1.getPublicKey(okm, true),
+      };
+    }
+    counter++;
+    if (counter > 100) throw new Error('deriveLockeFromDeed: reject-sampling failed (cosmological event)');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// signCredential
+//
+// Signs a 32-byte Locke message with the Locke private key.
+// Schnorr BIP-340. Message is from buildLockeLoginMsg / buildLockeAuthoriseMsg
+// / buildLockeRevokeMsg — always a SHA-256 digest (32 bytes).
+//
+// @param {Uint8Array} privateKey  32-byte Locke private key
+// @param {Uint8Array} message     32-byte message
+// @returns {Uint8Array}  64-byte Schnorr signature
+// ---------------------------------------------------------------------------
+export function signCredential(privateKey, message) {
+  if (!(privateKey instanceof Uint8Array) || privateKey.length !== 32) {
+    throw new TypeError('signCredential: privateKey must be Uint8Array(32)');
+  }
+  if (!(message instanceof Uint8Array) || message.length !== 32) {
+    throw new TypeError('signCredential: message must be Uint8Array(32)');
+  }
+  return schnorr.sign(message, privateKey);
+}
+
+// ---------------------------------------------------------------------------
+// verifyCredential
+//
+// Verifies a Schnorr BIP-340 signature over a Locke message.
+// Accepts compressed 33-byte pubkey and strips the parity byte automatically.
+//
+// @param {Uint8Array|string} pubkey     33-byte compressed pubkey or 66-char hex
+// @param {Uint8Array|string} signature  64-byte signature or 128-char hex
+// @param {Uint8Array}        message    32-byte message
+// @returns {boolean}
+// ---------------------------------------------------------------------------
+export function verifyCredential(pubkey, signature, message) {
+  const pubBytes = _mcpEnsureBytes(pubkey, 33, 'pubkey');
+  const sigBytes = _mcpEnsureBytes(signature, 64, 'signature');
+  if (!(message instanceof Uint8Array) || message.length !== 32) {
+    throw new TypeError('verifyCredential: message must be Uint8Array(32)');
+  }
+  const xonly = pubBytes.slice(1); // drop parity byte — BIP-340 is x-only
+  try {
+    return schnorr.verify(sigBytes, message, xonly);
+  } catch {
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// buildLockeLoginMsg
+//
+// msg = SHA-256(utf8("refueler.locke.login.v1") ‖ utf8(harbourUuid) ‖ hexToBytes(challengeHex))
+//
+// @param {string} harbourUuid
+// @param {string} challengeHex  32-byte hex (64 chars)
+// @returns {Uint8Array}  32-byte message
+// ---------------------------------------------------------------------------
+export function buildLockeLoginMsg(harbourUuid, challengeHex) {
+  return _mcpBuildMsg(_MCP_DOMAIN_LOGIN, harbourUuid, _mcpHexToBytes(challengeHex, 32, 'challengeHex'));
+}
+
+// ---------------------------------------------------------------------------
+// buildLockeAuthoriseMsg
+//
+// msg = SHA-256(utf8("refueler.locke.authorise.v1") ‖ utf8(harbourUuid) ‖ hexToBytes(newPubkeyHex))
+//
+// @param {string} harbourUuid
+// @param {string} newPubkeyHex  33-byte compressed pubkey hex (66 chars)
+// @returns {Uint8Array}  32-byte message
+// ---------------------------------------------------------------------------
+export function buildLockeAuthoriseMsg(harbourUuid, newPubkeyHex) {
+  return _mcpBuildMsg(_MCP_DOMAIN_AUTHORISE, harbourUuid, _mcpHexToBytes(newPubkeyHex, 33, 'newPubkeyHex'));
+}
+
+// ---------------------------------------------------------------------------
+// buildLockeRevokeMsg
+//
+// msg = SHA-256(utf8("refueler.locke.revoke.v1") ‖ utf8(harbourUuid) ‖ hexToBytes(targetPubkeyHex))
+//
+// @param {string} harbourUuid
+// @param {string} targetPubkeyHex  33-byte compressed pubkey hex (66 chars)
+// @returns {Uint8Array}  32-byte message
+// ---------------------------------------------------------------------------
+export function buildLockeRevokeMsg(harbourUuid, targetPubkeyHex) {
+  return _mcpBuildMsg(_MCP_DOMAIN_REVOKE, harbourUuid, _mcpHexToBytes(targetPubkeyHex, 33, 'targetPubkeyHex'));
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+function _mcpHexToBytes(hex, expectedLen, name) {
+  if (typeof hex !== 'string' || hex.length !== expectedLen * 2 || !/^[0-9a-fA-F]+$/.test(hex)) {
+    throw new TypeError(`${name} must be ${expectedLen}-byte hex (${expectedLen * 2} chars), got "${hex}"`);
+  }
+  const bytes = new Uint8Array(expectedLen);
+  for (let i = 0; i < expectedLen; i++) bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  return bytes;
+}
+
+function _mcpEnsureBytes(val, expectedLen, name) {
+  if (typeof val === 'string') return _mcpHexToBytes(val, expectedLen, name);
+  if (val instanceof Uint8Array && val.length === expectedLen) return val;
+  throw new TypeError(`${name} must be Uint8Array(${expectedLen}) or ${expectedLen * 2}-char hex`);
+}
+
+function _mcpBuildMsg(domain, harbourUuid, extraBytes) {
+  if (!harbourUuid) throw new TypeError('harbourUuid required');
+  const enc = new TextEncoder();
+  const t = enc.encode(domain), u = enc.encode(harbourUuid);
+  const combined = new Uint8Array(t.length + u.length + extraBytes.length);
+  combined.set(t); combined.set(u, t.length); combined.set(extraBytes, t.length + u.length);
+  return sha256(combined);
+}
