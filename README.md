@@ -1,6 +1,5 @@
 # @refueler/mcp-server
 
-[![npm](https://img.shields.io/npm/v/@refueler/mcp-server)](https://www.npmjs.com/package/@refueler/mcp-server)
 [![Apache 2.0](https://img.shields.io/badge/licence-Apache_2.0-blue)](./LICENSE)
 
 ---
@@ -12,9 +11,16 @@ privacy-first file-transfer capability backed by Refueler Share. The server
 handles local encryption, BLAKE3 chunk integrity, and upload orchestration;
 the Refueler Worker relays the resulting ciphertext to R2 storage without
 being able to read it. Four tools ship in v0.1: `refueler_capabilities`,
-`refueler_quote`, `refueler_send_file`, and `refueler_check_transfer`. The
-identity rail — HMAC-authenticated, credit-pool-funded — is live and
-demoable today. The anonymous rail, which settles transfers over Lightning
+`refueler_quote`, `refueler_send_file`, and `refueler_check_transfer`.
+
+> **Status: in development — not yet published to npm.** The Refueler
+> Worker moved to direct-to-R2 uploads (`initiate` → signed uploads →
+> `finalise`); `refueler_send_file` is being moved onto that path and cannot
+> complete a transfer against production until it lands. This README will be
+> updated when it does.
+
+The identity rail — HMAC-authenticated, credit-pool-funded — is the first
+rail this server targets. The anonymous rail, which settles transfers over Lightning
 with no identity at all, gates on the B7 infrastructure milestone and is not
 in this release.
 
@@ -31,9 +37,8 @@ product is right for your threat model.
   leaves the process. The session key lives in the returned `share_url`
   fragment only — it is never transmitted to the Refueler Worker, never
   written to a log, never present in any request.
-- Computes a BLAKE3 integrity hash over each ciphertext chunk and verifies
-  it on the Worker's behalf. The Worker rejects any chunk whose hash does
-  not match.
+- Computes a BLAKE3 hash over each ciphertext chunk and a Merkle root over
+  those hashes, and hands both to the Worker when the upload is finalised.
 - Holds your API credentials (`rfs_live_`, `rfs_sign_`) locally, in your
   environment. They are used to sign HMAC-SHA256 requests outbound to the
   Refueler API. They never leave your infrastructure in any request payload.
@@ -66,15 +71,18 @@ product is right for your threat model.
 
 **What "chunk integrity" means, and what it does not**
 
-Per-chunk BLAKE3 verification is live: the Worker rejects tampered or
-corrupted individual chunks at upload. Full Merkle-root verification —
-where the Worker reconstructs the complete ciphertext Merkle tree on
-download and compares it against the root committed at upload — is
-in build (B9) and not yet live. Until B9-3 ships, the correct claim is
-"chunk integrity," not "ciphertext storage integrity" and not
-"end-to-end file integrity." The recipient's browser verifies the
-full plaintext BLAKE3 root on their side; that is the end-to-end check.
-It does not pass through this server.
+Ciphertext storage integrity is live on the Refueler Worker. At upload,
+the per-chunk BLAKE3 hashes and the Merkle root over them
+(`rfc6962-unbalanced-blake3-v1`) are recorded when the transfer is
+finalised. On download, the Worker checks each stored chunk against that
+record before serving it and refuses (`409`) on any mismatch. The claim
+this supports is "the encrypted object served equals the encrypted object
+stored" — ciphertext storage integrity.
+
+It is not end-to-end file integrity. The Worker never sees plaintext, so it
+cannot vouch for the file you meant to send. Only the recipient, after
+decrypting, can check the plaintext — and that check never passes through
+this server or the Worker.
 
 **The server runs in your infrastructure.** Refueler has no visibility
 into your MCP server process, your credential store, or your agent's
@@ -109,6 +117,8 @@ and `rfs_sign_` prefixes are pattern-matched by common secret scanners.
 ---
 
 ## Install
+
+Not yet on npm (see Status above). When published:
 
 ```bash
 npm install @refueler/mcp-server
@@ -154,10 +164,9 @@ inbox — is not in v0.1. A recipient in v0.1 collects via a browser link.
 
 ## Licence
 
-Apache 2.0. The patent grant clause in §3 of the Apache licence covers
-the BLAKE3 + Cashu combination used in this server and in the Refueler
-Worker, so you can build on it without worrying about downstream patent risk
-from that pairing.
+Apache 2.0. §3 of the licence gives you an express patent licence from
+contributors for their contributions, so you can build on this server
+without patent risk from those who wrote it.
 
 ---
 
