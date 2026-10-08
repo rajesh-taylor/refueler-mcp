@@ -1,710 +1,678 @@
 /**
- * test/send.test.js — refueler_send_file tool tests
+ * test/send.test.js — refueler_send_file tool tests (rewritten at MCP-Fix-1)
  *
  * node:test only. No vitest.
- * Test credentials use rfs_test_ prefix — never rfs_live_ or rfs_sign_.
+ * Test credentials use the rfs_test_ prefix — never rfs_live_ or rfs_sign_.
+ *
+ * The tool now drives the direct-to-R2 path, so these tests stand in for the
+ * three Worker endpoints and for R2 itself:
+ *
+ *   POST /upload/:uuid/initiate → session token + presigned URLs + tail URL
+ *   PUT  <presigned URL>        → captured, with its exact byte length
+ *   POST /upload/:uuid/urls     → the next batch
+ *   POST /upload/:uuid/finalise → hashes + merkle_root
  *
  * Coverage:
- *   - Happy path: correct output shape, share_url contains #, cost_credits matches rate card
- *   - X-File-Name header is always "encrypted-payload" — D-1 invariant
- *   - 402 stops before any chunk upload (all four codes)
- *   - passphrase → passphrase_required: true
- *   - permanent_record → seal_nonce present in fragment (v1 JSON, s field)
- *   - Error matrix: 401, 415, 400 upload_rejected, 409
- *   - Vocabulary: no "sats" / "ecash" / "tokens" in any output field
+ *   - happy path output shape; share_url carries ?uuid= AND a v2 fragment
+ *   - X-File-Name is always "encrypted-payload" (D-1), and the real name,
+ *     the key and the passphrase appear ONLY where they should
+ *   - parts are v2: decryptable under the derived part key, plaintext + 16 bytes
+ *   - the finalise merkle_root equals the tree over the bytes R2 received
+ *   - multi-part: the tail URL is used for part N−1 and /urls is not asked for it
+ *   - at most two PUTs are open at once
+ *   - 402 at issue and at initiate stop before any part is uploaded
+ *   - error matrix: 401, 403, 409, 413, 503, finalise 409, R2 403
+ *   - permanent_record is refused rather than faked
+ *   - vocabulary: no "sats" / "ecash" / "tokens" in any output field
  */
 
-import { test, describe, beforeEach } from 'node:test';
+import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { handleSendFile, sendFileTool } from '../src/tools/send.js';
-
-// ---------------------------------------------------------------------------
-// Helpers & mocks
-// ---------------------------------------------------------------------------
-
-/** Build a minimal stat response for a file of the given size */
-function makeStatResult(sizeBytes = 1024) {
-  return {
-    size: sizeBytes,
-    isFile: () => true,
-  };
-}
-
-/**
- * Mock the fs/promises.stat and the chunkFile generator used inside send.js.
- *
- * Because send.js imports from src/crypto.js (chunkFile, encryptChunk, etc.)
- * at module load time and Node's test runner does not provide deep mock injection,
- * we test handleSendFile by building a thin harness:
- *   - Inject a mock apiClient that controls HTTP responses
- *   - Patch stat via a wrapper that is passed in config
- *   - Use a real (but tiny) file via Node's tmp mechanism
- *
- * For the unit test layer we stub the internals by passing a custom apiClient
- * that captures calls and returns controlled responses.
- */
-
-/** Minimal apiClient factory */
-function makeApiClient({
-  issueStatus   = 200,
-  issueBody     = { uuid: 'test-uuid-1234', signed_point: 'sp', mint_pubkey: 'pk', commitment: 'cmt', issued_tier: 'api' },
-  uploadStatus  = 200,
-  uploadBody    = {},
-} = {}) {
-  const calls = { post: [], put: [] };
-
-  return {
-    calls,
-
-    async post(path, body) {
-      calls.post.push({ path, body });
-      return {
-        status: issueStatus,
-        ok: issueStatus >= 200 && issueStatus < 300,
-        body: issueBody,
-      };
-    },
-
-    async put(path, data, headers) {
-      calls.put.push({ path, data, headers });
-      return {
-        status: uploadStatus,
-        ok: uploadStatus >= 200 && uploadStatus < 300,
-        body: uploadBody,
-      };
-    },
-  };
-}
-
-/** Minimal config stub (Chartered tier) */
-const TEST_CONFIG = {
-  liveKey: 'rfs_test_live_abcdef',
-  signKey: 'rfs_test_sign_abcdef',
-};
-
-// ---------------------------------------------------------------------------
-// Because handleSendFile calls real fs/promises.stat and real chunkFile
-// (which reads from disk), we use a real temp file for happy-path tests
-// and exercise error paths by passing a non-existent path.
-// ---------------------------------------------------------------------------
-
-import { writeFile, unlink, mkdtemp } from 'node:fs/promises';
+import { writeFile, mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
+import { handleSendFile, sendFileTool } from '../src/tools/send.js';
+import { derivePartKey, decryptPart, blake3Chunk, CHUNK_SIZE } from '../src/crypto.js';
+import { buildMerkleTree } from '../src/merkle.js';
+import { parseFragment } from '../src/fragment.js';
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+const hex = (b) => Array.from(new Uint8Array(b), (x) => x.toString(16).padStart(2, '0')).join('');
+const b64urlToBytes = (s) =>
+  new Uint8Array(Buffer.from(s.replace(/-/g, '+').replace(/_/g, '/'), 'base64'));
+
+const TEST_UUID = '11111111-2222-4333-8444-555555555555';
+
+/** Parse the single text block a handler returns. */
+function parse(result) {
+  assert.ok(Array.isArray(result), 'handler must return a content array');
+  assert.equal(result.length, 1);
+  assert.equal(result[0].type, 'text');
+  return JSON.parse(result[0].text);
+}
+
+/** A credential provider that never touches the network. */
+function makeCredentialProvider(overrides = {}) {
+  return async () => ({
+    uuid:         TEST_UUID,
+    credential:   JSON.stringify({ id: '00ab', amount: 1, secret: 'ff'.repeat(32), C: '02' + 'bb'.repeat(32) }),
+    commitment:   'rfs_test_commitment',
+    issuedTier:   'api',
+    extraHeaders: {},
+    ...overrides,
+  });
+}
+
+/**
+ * makeHarness — stands in for the Worker and R2.
+ * Captures every call so a test can assert on headers, bodies and part bytes.
+ */
+function makeHarness({
+  initiateStatus = 200,
+  initiateBody   = null,
+  urlsStatus     = 200,
+  finaliseStatus = 200,
+  finaliseBody   = { ok: true },
+  putStatus      = 200,
+  batchSize      = 256,
+} = {}) {
+  const calls = { initiate: [], urls: [], finalise: [], puts: [], maxInFlight: 0 };
+  let inFlight = 0;
+
+  const api = {
+    async call(method, path, opts = {}) {
+      if (path.endsWith('/initiate')) {
+        calls.initiate.push({ method, path, headers: opts.extraHeaders || {} });
+        if (initiateStatus !== 200) {
+          return { ok: false, status: initiateStatus, body: initiateBody, text: '' };
+        }
+        const totalChunks = Number(opts.extraHeaders['X-Total-Chunks']);
+        const fullCount   = totalChunks - 1;
+        const firstCount  = Math.min(fullCount, batchSize);
+        const urls = [];
+        for (let i = 0; i < firstCount; i++) {
+          urls.push({ index: i, url: `https://r2.test/part/${i}`, expires: 0 });
+        }
+        return {
+          ok: true, status: 200, text: '',
+          body: initiateBody ?? {
+            uuid:          TEST_UUID,
+            session_token: 'rfs_test_session',
+            part_size:     CHUNK_SIZE,
+            total_chunks:  totalChunks,
+            urls,
+            batch_next:    fullCount > batchSize ? batchSize : null,
+            tail_url:      { index: fullCount, url: `https://r2.test/tail/${fullCount}`, expires: 0 },
+          },
+        };
+      }
+
+      if (path.endsWith('/urls')) {
+        const body = JSON.parse(opts.body);
+        calls.urls.push({ ...body, session: opts.extraHeaders?.['X-Upload-Session'] });
+        if (urlsStatus !== 200) return { ok: false, status: urlsStatus, body: null, text: '' };
+        const urls = [];
+        for (let i = body.from; i < body.from + Math.min(body.count, batchSize); i++) {
+          urls.push({ index: i, url: `https://r2.test/part/${i}`, expires: 0 });
+        }
+        return { ok: true, status: 200, text: '', body: { uuid: TEST_UUID, urls, batch_next: null } };
+      }
+
+      if (path.endsWith('/finalise')) {
+        calls.finalise.push({
+          body:    JSON.parse(opts.body),
+          session: opts.extraHeaders?.['X-Upload-Session'],
+        });
+        return {
+          ok:     finaliseStatus >= 200 && finaliseStatus < 300,
+          status: finaliseStatus, body: finaliseBody, text: '',
+        };
+      }
+
+      throw new Error(`harness got an unexpected call: ${method} ${path}`);
+    },
+  };
+
+  async function putPart(url, bytes) {
+    inFlight++;
+    calls.maxInFlight = Math.max(calls.maxInFlight, inFlight);
+    // Yield once so overlapping PUTs are actually observable.
+    await new Promise(r => setImmediate(r));
+    calls.puts.push({ url, length: bytes.length, bytes: Uint8Array.from(bytes) });
+    inFlight--;
+    if (putStatus !== 200) return { ok: false, status: putStatus, etag: '', text: 'rejected' };
+    return { ok: true, status: 200, etag: 'rfs_test_etag', text: '' };
+  }
+
+  return { api, putPart, calls };
+}
+
+const TEST_CONFIG = { liveKey: 'rfs_test_live_key', signKey: 'rfs_test_sign_key', rail: 'identity' };
+
 let tmpDir;
-let tmpFile;
-const FILE_CONTENT = Buffer.from('The quick brown fox — refueler test payload');
+before(async () => { tmpDir = await mkdtemp(join(tmpdir(), 'rfs_test_send_')); });
+after(async () => { if (tmpDir) await rm(tmpDir, { recursive: true, force: true }); });
 
-async function setup() {
-  tmpDir  = await mkdtemp(join(tmpdir(), 'rftest-'));
-  tmpFile = join(tmpDir, 'test-file.txt');
-  await writeFile(tmpFile, FILE_CONTENT);
+/** Write a deterministic test file and return its path + bytes. */
+async function makeFile(name, size) {
+  const bytes = new Uint8Array(size);
+  for (let i = 0; i < size; i++) bytes[i] = (i * 31 + 7) & 0xff;
+  const filePath = join(tmpDir, name);
+  await writeFile(filePath, bytes);
+  return { filePath, bytes };
 }
 
-async function teardown() {
-  try { await unlink(tmpFile); } catch {}
-}
-
-// ---------------------------------------------------------------------------
-// Rate card helper (must match send.js exactly)
-// ---------------------------------------------------------------------------
-function computeCostLocal(sizeBytes, permanentRecord = false) {
-  const gbCredits = Math.ceil(sizeBytes / 1_000_000_000) * 100;
-  return 10 + gbCredits + (permanentRecord ? 20 : 0);
-}
-
-// ---------------------------------------------------------------------------
-// Fragment v1 decoder — for verifying seal_nonce presence
-// ---------------------------------------------------------------------------
-function decodeFragmentV1(fragmentBlob) {
-  // Reverse of assembleFragment: base64url → UTF-8 → JSON
-  const base64 = fragmentBlob.replace(/-/g, '+').replace(/_/g, '/');
-  const mod     = base64.length % 4;
-  const padded  = mod === 0 ? base64 : base64 + '===='.slice(mod);
-  const binary  = atob(padded);
-  const bytes   = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  return JSON.parse(new TextDecoder().decode(bytes));
-}
-
-// ---------------------------------------------------------------------------
-// Test suite
-// ---------------------------------------------------------------------------
-
-describe('refueler_send_file', async () => {
-
-  // Run setup once before all tests (node:test hooks)
-  let setupDone = false;
-  beforeEach(async () => {
-    if (!setupDone) {
-      await setup();
-      setupDone = true;
-    }
+/** Run the tool against a harness. */
+async function send(input, harnessOpts = {}, depsExtra = {}) {
+  const harness = makeHarness(harnessOpts);
+  const result = await handleSendFile(input, {
+    api:             harness.api,
+    config:          TEST_CONFIG,
+    issueCredential: makeCredentialProvider(),
+    putPart:         harness.putPart,
+    ...depsExtra,
   });
+  return { out: parse(result), calls: harness.calls, harness };
+}
 
-  // ── Tool schema ───────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Tool definition
+// ---------------------------------------------------------------------------
 
-  test('tool name is refueler_send_file', () => {
+describe('sendFileTool definition', () => {
+  test('is named refueler_send_file and requires file_path', () => {
     assert.equal(sendFileTool.name, 'refueler_send_file');
-  });
-
-  test('file_path is required in input schema', () => {
     assert.deepEqual(sendFileTool.inputSchema.required, ['file_path']);
   });
 
-  test('schema has no sats/ecash/tokens in description strings', () => {
-    const schema = JSON.stringify(sendFileTool);
-    assert.ok(!schema.includes('sats'),   'schema must not mention "sats"');
-    assert.ok(!schema.includes('ecash'),  'schema must not mention "ecash"');
-    assert.ok(!schema.includes('tokens'), 'schema must not mention "tokens"');
+  test('schema no longer offers permanent_record as a send option', () => {
+    assert.equal(sendFileTool.inputSchema.properties.permanent_record, undefined);
   });
 
-  // ── Happy path ────────────────────────────────────────────────────────────
+  test('description and schema never say sats, ecash or tokens', () => {
+    const text = JSON.stringify(sendFileTool).toLowerCase();
+    for (const word of ['sats', 'ecash', 'tokens']) {
+      assert.ok(!text.includes(word), `tool definition must not say "${word}"`);
+    }
+  });
+});
 
-  test('happy path — correct output shape', async () => {
-    await setup();
-    const client = makeApiClient();
-    const result = await handleSendFile(
-      { file_path: tmpFile },
-      { apiClient: client, config: TEST_CONFIG },
-    );
+// ---------------------------------------------------------------------------
+// Happy path — single part
+// ---------------------------------------------------------------------------
 
-    assert.ok(Array.isArray(result), 'result is MCP content array');
-    assert.equal(result[0].type, 'text');
-    const data = JSON.parse(result[0].text);
+describe('happy path — one part', () => {
+  test('returns the expected envelope', async () => {
+    const { filePath } = await makeFile('one.bin', 4096);
+    const { out, calls } = await send({ file_path: filePath });
 
-    assert.ok(typeof data.uuid        === 'string', 'uuid present');
-    assert.ok(typeof data.share_url   === 'string', 'share_url present');
-    assert.ok(typeof data.expires_at  === 'number', 'expires_at present');
-    assert.ok(typeof data.size_bytes  === 'number', 'size_bytes present');
-    assert.ok(typeof data.cost_credits === 'number', 'cost_credits present');
-    assert.ok(typeof data.passphrase_required === 'boolean', 'passphrase_required present');
-    assert.equal(data.collection_receipt_available, true, 'collection_receipt_available true');
+    assert.equal(out.error, undefined, out.detail);
+    assert.equal(out.uuid, TEST_UUID);
+    assert.equal(out.size_bytes, 4096);
+    assert.equal(out.total_parts, 1);
+    assert.equal(out.passphrase_required, false);
+    assert.equal(out.tree_algo, 'rfc6962-unbalanced-blake3-v1');
+    assert.equal(typeof out.expires_at, 'number');
+    // Rate card v1.0: 10 per transfer + 100 per GB band.
+    assert.equal(out.cost_credits, 110);
+
+    assert.equal(calls.initiate.length, 1);
+    assert.equal(calls.puts.length, 1);
+    assert.equal(calls.finalise.length, 1);
+    // One part means the tail URL is the only URL; /urls is never called.
+    assert.equal(calls.urls.length, 0);
   });
 
-  test('share_url contains # fragment separator', async () => {
-    await setup();
-    const client = makeApiClient();
-    const result = await handleSendFile(
-      { file_path: tmpFile },
-      { apiClient: client, config: TEST_CONFIG },
-    );
-    const data = JSON.parse(result[0].text);
-    assert.ok(data.share_url.includes('#'), 'share_url must contain # fragment');
+  test('share_url carries ?uuid= and a v2 fragment', async () => {
+    const { filePath } = await makeFile('url.bin', 2048);
+    const { out } = await send({ file_path: filePath });
+
+    assert.ok(out.share_url.startsWith('https://refueler.io/share/?uuid='),
+      `share_url must point at the live receiver: ${out.share_url}`);
+    assert.ok(out.share_url.includes(`?uuid=${TEST_UUID}#`), 'uuid must precede the fragment');
+
+    const parsed = parseFragment(out.share_url.split('#')[1]);
+    assert.equal(parsed.v, 2);
+    assert.equal(parsed.filename, 'url.bin');
+    assert.equal(parsed.sizeBytes, 2048);
+    assert.equal(parsed.ivBytes, null, 'v2 carries no IV');
+    assert.equal(parsed.sealNonce, null);
+    assert.equal(parsed.keyBytes.length, 32);
   });
 
-  test('share_url starts with https://share.refueler.io/', async () => {
-    await setup();
-    const client = makeApiClient();
-    const result = await handleSendFile(
-      { file_path: tmpFile },
-      { apiClient: client, config: TEST_CONFIG },
-    );
-    const data = JSON.parse(result[0].text);
-    assert.ok(data.share_url.startsWith('https://share.refueler.io/'), 'share_url has correct base');
+  test('the fragment size agrees with the part count the receiver checks', async () => {
+    const { filePath } = await makeFile('size.bin', 9000);
+    const { out } = await send({ file_path: filePath });
+    const parsed = parseFragment(out.share_url.split('#')[1]);
+    assert.equal(Math.ceil(parsed.sizeBytes / CHUNK_SIZE), out.total_parts);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// D-1 and fragment-only secrets
+// ---------------------------------------------------------------------------
+
+describe('D-1 invariant and what never reaches the Worker', () => {
+  test('X-File-Name is the constant placeholder', async () => {
+    const { filePath } = await makeFile('secret-report.pdf', 1234);
+    const { calls } = await send({ file_path: filePath });
+    assert.equal(calls.initiate[0].headers['X-File-Name'], 'encrypted-payload');
   });
 
-  test('cost_credits matches rate card for file size', async () => {
-    await setup();
-    const client = makeApiClient();
-    const result = await handleSendFile(
-      { file_path: tmpFile },
-      { apiClient: client, config: TEST_CONFIG },
-    );
-    const data = JSON.parse(result[0].text);
-    const expected = computeCostLocal(FILE_CONTENT.length, false);
-    assert.equal(data.cost_credits, expected, 'cost_credits matches rate card v1.0');
+  test('the real filename is in no request the Worker sees', async () => {
+    const { filePath } = await makeFile('payroll-2026.xlsx', 1000);
+    const { out, calls } = await send({ file_path: filePath });
+
+    const sent = JSON.stringify({ initiate: calls.initiate, urls: calls.urls, finalise: calls.finalise });
+    assert.ok(!sent.includes('payroll-2026'), 'the filename must never leave in a request');
+    assert.equal(parseFragment(out.share_url.split('#')[1]).filename, 'payroll-2026.xlsx');
   });
 
-  // ── D-1 invariant — X-File-Name is always "encrypted-payload" ────────────
+  test('the transfer key is in no request the Worker sees', async () => {
+    const { filePath } = await makeFile('key.bin', 777);
+    const { out, calls } = await send({ file_path: filePath });
 
-  test('D-1: X-File-Name header on chunk 0000 is always "encrypted-payload"', async () => {
-    await setup();
-    const client = makeApiClient();
-    await handleSendFile(
-      { file_path: tmpFile },
-      { apiClient: client, config: TEST_CONFIG },
-    );
-    const firstPut = client.calls.put[0];
-    assert.ok(firstPut, 'chunk 0000 PUT must be made');
-    assert.equal(
-      firstPut.headers['X-File-Name'],
-      'encrypted-payload',
-      'X-File-Name must be the constant placeholder, never the real filename',
-    );
+    const keyHex = hex(parseFragment(out.share_url.split('#')[1]).keyBytes);
+    const sent = JSON.stringify({ initiate: calls.initiate, urls: calls.urls, finalise: calls.finalise });
+    assert.ok(!sent.toLowerCase().includes(keyHex), 'the key must never leave this process');
   });
 
-  test('D-1: X-File-Name is "encrypted-payload" regardless of file name', async () => {
-    await setup();
-    // Use a file with a distinctive name
-    const namedFile = join(tmpDir, 'my-secret-contract.pdf');
-    await writeFile(namedFile, FILE_CONTENT);
+  test('initiate gets the byte count (cap, cost, tail length) and the part count', async () => {
+    const { filePath } = await makeFile('bytes.bin', 5555);
+    const { calls } = await send({ file_path: filePath });
+    assert.equal(calls.initiate[0].headers['X-Total-Bytes'], '5555');
+    assert.equal(calls.initiate[0].headers['X-Total-Chunks'], '1');
+  });
+});
 
-    const client = makeApiClient();
-    await handleSendFile(
-      { file_path: namedFile },
-      { apiClient: client, config: TEST_CONFIG },
-    );
-    const firstPut = client.calls.put[0];
-    assert.equal(firstPut.headers['X-File-Name'], 'encrypted-payload');
+// ---------------------------------------------------------------------------
+// Part crypto on the wire
+// ---------------------------------------------------------------------------
 
-    try { await unlink(namedFile); } catch {}
+describe('what R2 actually receives', () => {
+  test('each part is v2 ciphertext: plaintext + 16, decryptable at its index', async () => {
+    const size = 3000;
+    const { filePath, bytes } = await makeFile('v2.bin', size);
+    const { out, calls } = await send({ file_path: filePath });
+
+    assert.equal(calls.puts.length, 1);
+    assert.equal(calls.puts[0].length, size + 16, 'stored part is plaintext + the 16-byte tag');
+
+    const key = parseFragment(out.share_url.split('#')[1]).keyBytes;
+    const decKey = await derivePartKey(key, ['decrypt']);
+    const plain = await decryptPart(decKey, calls.puts[0].bytes, 0, 1);
+    assert.equal(hex(plain), hex(bytes), 'the recipient gets the original bytes back');
   });
 
-  test('D-1: real filename is NOT "encrypted-payload" — it travels in the URL fragment', async () => {
-    await setup();
-    const namedFile = join(tmpDir, 'contract.docx');
-    await writeFile(namedFile, FILE_CONTENT);
+  test('the part is not decryptable with the transfer key itself', async () => {
+    const { filePath } = await makeFile('notk.bin', 512);
+    const { out, calls } = await send({ file_path: filePath });
 
-    const client = makeApiClient();
-    const result = await handleSendFile(
-      { file_path: namedFile },
-      { apiClient: client, config: TEST_CONFIG },
-    );
-    const data     = JSON.parse(result[0].text);
-    const fragment = data.share_url.split('#')[1];
-    const parsed   = decodeFragmentV1(fragment);
-
-    assert.equal(parsed.v, 1, 'fragment v field is 1');
-    assert.equal(parsed.n, 'contract.docx', 'real filename in fragment n field');
-    assert.ok(typeof parsed.k === 'string' && parsed.k.length > 0, 'AES key in fragment k field');
-
-    try { await unlink(namedFile); } catch {}
+    const key = parseFragment(out.share_url.split('#')[1]).keyBytes;
+    const kKey = await crypto.subtle.importKey('raw', key, 'AES-GCM', false, ['decrypt']);
+    const nonce = new Uint8Array(12); nonce[11] = 1;
+    await assert.rejects(() => crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: nonce, additionalData: new Uint8Array(4) }, kKey, calls.puts[0].bytes));
   });
 
-  // ── 402 — stops before any chunk upload ──────────────────────────────────
+  test('finalise sends the Merkle root over exactly the bytes R2 stored', async () => {
+    const { filePath } = await makeFile('root.bin', 8192);
+    const { calls } = await send({ file_path: filePath });
 
-  test('402 overage_ceiling — stops before upload, returns payment_required envelope', async () => {
-    await setup();
-    const client = makeApiClient({
-      issueStatus: 402,
-      issueBody: {
-        code: 'overage_ceiling',
-        rail: 'identity',
-        remaining_credits: 0,
-      },
-    });
-    const result = await handleSendFile(
-      { file_path: tmpFile },
-      { apiClient: client, config: TEST_CONFIG },
-    );
-    const data = JSON.parse(result[0].text);
+    const digests = [blake3Chunk(calls.puts[0].bytes)];
+    const { root } = buildMerkleTree(digests);
 
-    assert.equal(data.error, 'payment_required');
-    assert.equal(data.code,  'overage_ceiling');
-    assert.equal(client.calls.put.length, 0, 'no chunk upload on 402');
+    const body = calls.finalise[0].body;
+    assert.equal(body.hashes.length, 1);
+    assert.equal(hex(b64urlToBytes(body.merkle_root)), hex(root));
+    assert.equal(hex(b64urlToBytes(body.hashes[0])), hex(digests[0]));
+    assert.equal(calls.finalise[0].session, 'rfs_test_session');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Multi-part
+// ---------------------------------------------------------------------------
+
+describe('multi-part transfer', () => {
+  test('two parts: tail URL used for N−1, parts reassemble into the original file', async () => {
+    const size = CHUNK_SIZE + 100;
+    const { filePath, bytes } = await makeFile('two.bin', size);
+    const { out, calls } = await send({ file_path: filePath });
+
+    assert.equal(out.error, undefined, out.detail);
+    assert.equal(out.total_parts, 2);
+    assert.equal(calls.puts.length, 2);
+
+    const byUrl = new Map(calls.puts.map(p => [p.url, p]));
+    const part0 = byUrl.get('https://r2.test/part/0');
+    const part1 = byUrl.get('https://r2.test/tail/1');
+    assert.ok(part0, 'part 0 goes to a batch URL');
+    assert.ok(part1, 'part 1 goes to the tail URL issued at initiate');
+
+    assert.equal(part0.length, CHUNK_SIZE + 16);
+    assert.equal(part1.length, 100 + 16);
+
+    // /urls is never asked for the tail index.
+    for (const u of calls.urls) assert.ok(u.from < 1, `/urls asked for ${u.from}, which is the tail`);
+
+    const key = parseFragment(out.share_url.split('#')[1]).keyBytes;
+    const decKey = await derivePartKey(key, ['decrypt']);
+    const p0 = await decryptPart(decKey, part0.bytes, 0, 2);
+    const p1 = await decryptPart(decKey, part1.bytes, 1, 2);
+    const joined = new Uint8Array(size);
+    joined.set(p0, 0);
+    joined.set(p1, CHUNK_SIZE);
+    assert.equal(hex(joined), hex(bytes));
+
+    // A part opened at the wrong index, or as the wrong "last", must fail.
+    await assert.rejects(() => decryptPart(decKey, part0.bytes, 1, 2));
+    await assert.rejects(() => decryptPart(decKey, part1.bytes, 1, 3));
   });
 
-  test('402 quota_exhausted — stops before upload', async () => {
-    await setup();
-    const client = makeApiClient({
-      issueStatus: 402,
-      issueBody: {
-        code: 'quota_exhausted',
-        rail: 'identity',
-        remaining_credits: 0,
-      },
-    });
-    const result = await handleSendFile(
-      { file_path: tmpFile },
-      { apiClient: client, config: TEST_CONFIG },
-    );
-    const data = JSON.parse(result[0].text);
+  test('no more than two parts are ever in flight at once', async () => {
+    const { filePath } = await makeFile('flight.bin', 2 * CHUNK_SIZE + 10);
+    const { calls } = await send({ file_path: filePath });
+    assert.ok(calls.maxInFlight <= 2, `saw ${calls.maxInFlight} parts in flight`);
+    assert.equal(calls.puts.length, 3);
+  });
+});
 
-    assert.equal(data.error, 'payment_required');
-    assert.equal(data.code,  'quota_exhausted');
-    assert.equal(client.calls.put.length, 0);
+// ---------------------------------------------------------------------------
+// Options
+// ---------------------------------------------------------------------------
+
+describe('options', () => {
+  test('passphrase → X-P2SH-Secret-Hash set and passphrase_required true', async () => {
+    const { filePath } = await makeFile('pass.bin', 100);
+    const { out, calls } = await send({ file_path: filePath, passphrase: 'correct horse battery staple' });
+    assert.equal(out.passphrase_required, true);
+    // The pinned SHA-256 of that phrase (PARITY.md test vector).
+    assert.equal(calls.initiate[0].headers['X-P2SH-Secret-Hash'],
+      'c4bbcb1fbec99d65bf59d85c8cb62ee2db963f0fe106f483d9afa73bd4e39a8a');
+    const everything = JSON.stringify({ calls, url: out.share_url });
+    assert.ok(!everything.includes('correct horse'), 'the passphrase must not leave this process');
   });
 
-  test('402 account_cancelled — stops before upload', async () => {
-    await setup();
-    const client = makeApiClient({
-      issueStatus: 402,
-      issueBody: {
-        code: 'account_cancelled',
-        rail: 'identity',
-      },
-    });
-    const result = await handleSendFile(
-      { file_path: tmpFile },
-      { apiClient: client, config: TEST_CONFIG },
-    );
-    const data = JSON.parse(result[0].text);
-
-    assert.equal(data.error, 'payment_required');
-    assert.equal(data.code,  'account_cancelled');
-    assert.equal(client.calls.put.length, 0);
-  });
-
-  test('402 credit_invalid — stops before upload', async () => {
-    await setup();
-    const client = makeApiClient({
-      issueStatus: 402,
-      issueBody: {
-        code: 'credit_invalid',
-        rail: 'anonymous',
-        remaining_credits: 0,
-      },
-    });
-    const result = await handleSendFile(
-      { file_path: tmpFile },
-      { apiClient: client, config: TEST_CONFIG },
-    );
-    const data = JSON.parse(result[0].text);
-
-    assert.equal(data.error, 'payment_required');
-    assert.equal(data.code,  'credit_invalid');
-    assert.equal(client.calls.put.length, 0);
-  });
-
-  test('402 payment envelope has out_of_band_v1 method and dashboard_url', async () => {
-    await setup();
-    const client = makeApiClient({
-      issueStatus: 402,
-      issueBody: { code: 'overage_ceiling', rail: 'identity', remaining_credits: 0 },
-    });
-    const result = await handleSendFile(
-      { file_path: tmpFile },
-      { apiClient: client, config: TEST_CONFIG },
-    );
-    const data = JSON.parse(result[0].text);
-
-    assert.equal(data.payment.method,        'out_of_band_v1');
-    assert.equal(data.payment.dashboard_url, 'https://refueler.io/share/');
-    assert.equal(data.payment.offer,         null, 'offer must be null in v1');
-  });
-
-  test('402 shortfall_credits is non-negative', async () => {
-    await setup();
-    const client = makeApiClient({
-      issueStatus: 402,
-      issueBody: { code: 'overage_ceiling', rail: 'identity', remaining_credits: 5 },
-    });
-    const result = await handleSendFile(
-      { file_path: tmpFile },
-      { apiClient: client, config: TEST_CONFIG },
-    );
-    const data = JSON.parse(result[0].text);
-    assert.ok(data.shortfall_credits >= 0, 'shortfall_credits is non-negative');
-  });
-
-  // ── passphrase ────────────────────────────────────────────────────────────
-
-  test('passphrase → passphrase_required: true in output', async () => {
-    await setup();
-    const client = makeApiClient();
-    const result = await handleSendFile(
-      { file_path: tmpFile, passphrase: 'correct horse battery staple' },
-      { apiClient: client, config: TEST_CONFIG },
-    );
-    const data = JSON.parse(result[0].text);
-    assert.equal(data.passphrase_required, true);
-  });
-
-  test('passphrase → X-P2SH-Secret-Hash present on chunk 0000', async () => {
-    await setup();
-    const client = makeApiClient();
-    await handleSendFile(
-      { file_path: tmpFile, passphrase: 'correct horse battery staple' },
-      { apiClient: client, config: TEST_CONFIG },
-    );
-    const firstPut = client.calls.put[0];
-    assert.ok(
-      typeof firstPut.headers['X-P2SH-Secret-Hash'] === 'string' &&
-      firstPut.headers['X-P2SH-Secret-Hash'].length > 0,
-      'X-P2SH-Secret-Hash must be present when passphrase supplied',
-    );
-  });
-
-  test('no passphrase → passphrase_required: false', async () => {
-    await setup();
-    const client = makeApiClient();
-    const result = await handleSendFile(
-      { file_path: tmpFile },
-      { apiClient: client, config: TEST_CONFIG },
-    );
-    const data = JSON.parse(result[0].text);
-    assert.equal(data.passphrase_required, false);
-  });
-
-  // ── permanent_record ──────────────────────────────────────────────────────
-
-  test('permanent_record → fragment contains s (seal_nonce) field', async () => {
-    await setup();
-    const client = makeApiClient();
-    const result = await handleSendFile(
-      { file_path: tmpFile, permanent_record: true },
-      { apiClient: client, config: TEST_CONFIG },
-    );
-    const data     = JSON.parse(result[0].text);
-    const fragment = data.share_url.split('#')[1];
-    const parsed   = decodeFragmentV1(fragment);
-
-    assert.equal(parsed.v, 1, 'v1 fragment');
-    assert.ok(typeof parsed.s === 'string' && parsed.s.length > 0, 'seal_nonce in fragment s field');
-  });
-
-  test('no permanent_record → fragment has no s field', async () => {
-    await setup();
-    const client = makeApiClient();
-    const result = await handleSendFile(
-      { file_path: tmpFile },
-      { apiClient: client, config: TEST_CONFIG },
-    );
-    const data     = JSON.parse(result[0].text);
-    const fragment = data.share_url.split('#')[1];
-    const parsed   = decodeFragmentV1(fragment);
-
-    assert.equal(parsed.s, undefined, 'no seal_nonce field when permanent_record not set');
-  });
-
-  test('permanent_record → cost_credits includes +20', async () => {
-    await setup();
-    const client = makeApiClient();
-    const result = await handleSendFile(
-      { file_path: tmpFile, permanent_record: true },
-      { apiClient: client, config: TEST_CONFIG },
-    );
-    const data    = JSON.parse(result[0].text);
-    const withPR  = computeCostLocal(FILE_CONTENT.length, true);
-    assert.equal(data.cost_credits, withPR);
-  });
-
-  // ── Manifest headers ──────────────────────────────────────────────────────
-
-  test('chunk 0000 has X-Cashu-Credential header', async () => {
-    await setup();
-    const client = makeApiClient();
-    await handleSendFile({ file_path: tmpFile }, { apiClient: client, config: TEST_CONFIG });
-    const firstPut = client.calls.put[0];
-    assert.ok(firstPut.headers['X-Cashu-Credential'], 'X-Cashu-Credential must be set');
-  });
-
-  test('chunk 0000 has X-Total-Chunks and X-Total-Bytes', async () => {
-    await setup();
-    const client = makeApiClient();
-    await handleSendFile({ file_path: tmpFile }, { apiClient: client, config: TEST_CONFIG });
-    const firstPut = client.calls.put[0];
-    assert.ok(firstPut.headers['X-Total-Chunks'], 'X-Total-Chunks present');
-    assert.ok(firstPut.headers['X-Total-Bytes'],  'X-Total-Bytes present');
-  });
-
-  test('destroy_after_download → X-Destroy-After-Download: "1"', async () => {
-    await setup();
-    const client = makeApiClient();
-    await handleSendFile(
-      { file_path: tmpFile, destroy_after_download: true },
-      { apiClient: client, config: TEST_CONFIG },
-    );
-    const firstPut = client.calls.put[0];
-    assert.equal(firstPut.headers['X-Destroy-After-Download'], '1');
-  });
-
-  test('no destroy_after_download → header absent', async () => {
-    await setup();
-    const client = makeApiClient();
-    await handleSendFile({ file_path: tmpFile }, { apiClient: client, config: TEST_CONFIG });
-    const firstPut = client.calls.put[0];
-    assert.equal(firstPut.headers['X-Destroy-After-Download'], undefined);
+  test('destroy_after_download → header "1"; absent otherwise', async () => {
+    const { filePath } = await makeFile('dad.bin', 100);
+    const on  = await send({ file_path: filePath, destroy_after_download: true });
+    const off = await send({ file_path: filePath });
+    assert.equal(on.calls.initiate[0].headers['X-Destroy-After-Download'], '1');
+    assert.equal(off.calls.initiate[0].headers['X-Destroy-After-Download'], undefined);
   });
 
   test('available_from / available_until forwarded as strings', async () => {
-    await setup();
-    const client = makeApiClient();
-    const from  = 1757000000;
-    const until = 1757100000;
-    await handleSendFile(
-      { file_path: tmpFile, available_from: from, available_until: until },
-      { apiClient: client, config: TEST_CONFIG },
-    );
-    const firstPut = client.calls.put[0];
-    assert.equal(firstPut.headers['X-Available-From'],  String(from));
-    assert.equal(firstPut.headers['X-Available-Until'], String(until));
-  });
-
-  test('transfer_ref truncated to 128 chars', async () => {
-    await setup();
-    const client  = makeApiClient();
-    const longRef = 'x'.repeat(200);
-    await handleSendFile(
-      { file_path: tmpFile, transfer_ref: longRef },
-      { apiClient: client, config: TEST_CONFIG },
-    );
-    const firstPut = client.calls.put[0];
-    assert.ok(
-      firstPut.headers['X-Transfer-Ref']?.length <= 128,
-      'X-Transfer-Ref must be ≤ 128 chars',
-    );
-  });
-
-  // ── Error matrix ──────────────────────────────────────────────────────────
-
-  test('file not found returns send_failed error', async () => {
-    const client = makeApiClient();
-    const result = await handleSendFile(
-      { file_path: '/tmp/does-not-exist-rftest-xyz.bin' },
-      { apiClient: client, config: TEST_CONFIG },
-    );
-    const data = JSON.parse(result[0].text);
-    assert.equal(data.error, 'send_failed');
-    assert.equal(client.calls.post.length, 0, 'no API call on missing file');
-    assert.equal(client.calls.put.length, 0);
-  });
-
-  test('401 from credential/issue → auth_failed', async () => {
-    await setup();
-    const client = makeApiClient({
-      issueStatus: 401,
-      issueBody: { detail: 'HMAC signature mismatch' },
+    const { filePath } = await makeFile('tidal.bin', 100);
+    const { calls } = await send({
+      file_path: filePath, available_from: 1800000000, available_until: 1800003600,
     });
-    const result = await handleSendFile(
-      { file_path: tmpFile },
-      { apiClient: client, config: TEST_CONFIG },
-    );
-    const data = JSON.parse(result[0].text);
-    assert.equal(data.error, 'auth_failed');
-    assert.equal(client.calls.put.length, 0);
+    assert.equal(calls.initiate[0].headers['X-Available-From'], '1800000000');
+    assert.equal(calls.initiate[0].headers['X-Available-Until'], '1800003600');
   });
 
-  test('415 from upload → file_type_denied', async () => {
-    await setup();
-    const client = makeApiClient({
-      uploadStatus: 415,
-      uploadBody: { detail: 'application/x-executable' },
+  test('transfer_ref is truncated to 128 characters', async () => {
+    const { filePath } = await makeFile('ref.bin', 100);
+    const { calls } = await send({ file_path: filePath, transfer_ref: 'r'.repeat(200) });
+    assert.equal(calls.initiate[0].headers['X-Transfer-Ref'].length, 128);
+  });
+
+  test('expiry requested is 7 days — the ceiling initiate enforces until B12-4a', async () => {
+    const { filePath } = await makeFile('exp.bin', 100);
+    const { out, calls } = await send({ file_path: filePath });
+    const requested = Number(calls.initiate[0].headers['X-Expiry-Timestamp']);
+    const window = requested - Math.floor(Date.now() / 1000);
+    assert.ok(window <= 7 * 24 * 3600 && window > 7 * 24 * 3600 - 60, `window was ${window}s`);
+    assert.equal(out.expires_at, requested);
+  });
+
+  test('permanent_record is refused, not faked', async () => {
+    const { filePath } = await makeFile('pr.bin', 100);
+    const { out, calls } = await send({ file_path: filePath, permanent_record: true });
+    assert.equal(out.error, 'not_supported');
+    assert.equal(calls.initiate.length, 0, 'nothing is initiated');
+    assert.equal(calls.puts.length, 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Failure matrix
+// ---------------------------------------------------------------------------
+
+describe('failures before anything is uploaded', () => {
+  test('a missing file returns send_failed', async () => {
+    const { out, calls } = await send({ file_path: join(tmpDir, 'does-not-exist.bin') });
+    assert.equal(out.error, 'send_failed');
+    assert.equal(calls.initiate.length, 0);
+  });
+
+  test('a path traversal sequence is refused', async () => {
+    const { out } = await send({ file_path: '../../etc/passwd' });
+    assert.equal(out.error, 'send_failed');
+    assert.match(out.detail, /traversal/);
+  });
+
+  test('an empty file is refused (initiate needs total_bytes >= 1)', async () => {
+    const { filePath } = await makeFile('empty.bin', 0);
+    const { out, calls } = await send({ file_path: filePath });
+    assert.equal(out.error, 'send_failed');
+    assert.equal(calls.initiate.length, 0);
+  });
+
+  test('a file over the advertised cap is refused before the credential is issued', async () => {
+    const { filePath } = await makeFile('big.bin', 4096);
+    const harness = makeHarness();
+    let issued = false;
+    const result = await handleSendFile({ file_path: filePath }, {
+      api:             harness.api,
+      config:          TEST_CONFIG,
+      capabilities:    { limits: { max_transfer_bytes: 1024 } },
+      issueCredential: async () => { issued = true; return makeCredentialProvider()(); },
+      putPart:         harness.putPart,
     });
-    const result = await handleSendFile(
-      { file_path: tmpFile },
-      { apiClient: client, config: TEST_CONFIG },
-    );
-    const data = JSON.parse(result[0].text);
-    assert.equal(data.error, 'file_type_denied');
+    const out = parse(result);
+    assert.equal(out.error, 'too_large');
+    assert.equal(out.max_transfer_bytes, 1024);
+    assert.equal(issued, false, 'no credential is issued for an over-cap file');
   });
 
-  test('400 upload_rejected from upload → upload_rejected', async () => {
-    await setup();
-    const client = makeApiClient({
-      uploadStatus: 400,
-      uploadBody: { error: 'upload_rejected', detail: 'Missing X-Cashu-Credential' },
+  test('402 at credential issue returns the payment_required envelope, nothing uploaded', async () => {
+    const { filePath } = await makeFile('p402.bin', 100);
+    const harness = makeHarness();
+    const result = await handleSendFile({ file_path: filePath }, {
+      api: harness.api, config: TEST_CONFIG, putPart: harness.putPart,
+      issueCredential: async () => {
+        const e = new Error('payment_required');
+        e.paymentRequired = {
+          code: 'quota_exhausted', rail: 'identity', remaining_credits: 5, shortfall_credits: 105,
+        };
+        throw e;
+      },
     });
-    const result = await handleSendFile(
-      { file_path: tmpFile },
-      { apiClient: client, config: TEST_CONFIG },
-    );
-    const data = JSON.parse(result[0].text);
-    assert.equal(data.error, 'upload_rejected');
+    const out = parse(result);
+    assert.equal(out.error, 'payment_required');
+    assert.equal(out.code, 'quota_exhausted');
+    assert.equal(out.shortfall_credits, 105);
+    assert.equal(out.remaining_credits, 5);
+    assert.equal(out.payment.method, 'out_of_band_v1');
+    assert.equal(harness.calls.initiate.length, 0);
+    assert.equal(harness.calls.puts.length, 0);
   });
 
-  test('400 integrity_failed from upload → integrity_failed with chunk', async () => {
-    await setup();
-    const client = makeApiClient({
-      uploadStatus: 400,
-      uploadBody: { error: 'integrity_failed', chunk: 0 },
+  test('account_cancelled omits remaining_credits', async () => {
+    const { filePath } = await makeFile('cancel.bin', 100);
+    const harness = makeHarness();
+    const result = await handleSendFile({ file_path: filePath }, {
+      api: harness.api, config: TEST_CONFIG, putPart: harness.putPart,
+      issueCredential: async () => {
+        const e = new Error('payment_required');
+        e.paymentRequired = { code: 'account_cancelled', rail: 'identity' };
+        throw e;
+      },
     });
-    const result = await handleSendFile(
-      { file_path: tmpFile },
-      { apiClient: client, config: TEST_CONFIG },
-    );
-    const data = JSON.parse(result[0].text);
-    assert.equal(data.error, 'integrity_failed');
-    assert.equal(data.chunk, 0);
+    const out = parse(result);
+    assert.equal(out.code, 'account_cancelled');
+    assert.equal(out.remaining_credits, undefined);
   });
 
-  test('409 from upload → already_complete with uuid', async () => {
-    await setup();
-    const client = makeApiClient({
-      uploadStatus: 409,
-      uploadBody: { error: 'already_complete', uuid: 'test-uuid-1234' },
+  test('an auth failure at issue returns auth_failed', async () => {
+    const { filePath } = await makeFile('auth.bin', 100);
+    const harness = makeHarness();
+    const result = await handleSendFile({ file_path: filePath }, {
+      api: harness.api, config: TEST_CONFIG, putPart: harness.putPart,
+      issueCredential: async () => {
+        const e = new Error('HMAC authentication failed.');
+        e.authFailed = true;
+        throw e;
+      },
     });
-    const result = await handleSendFile(
-      { file_path: tmpFile },
-      { apiClient: client, config: TEST_CONFIG },
-    );
-    const data = JSON.parse(result[0].text);
-    assert.equal(data.error, 'already_complete');
+    assert.equal(parse(result).error, 'auth_failed');
   });
 
-  // ── Vocabulary — no "sats"/"ecash"/"tokens" in any output field ───────────
-
-  test('vocabulary: no "sats" in any output on happy path', async () => {
-    await setup();
-    const client = makeApiClient();
-    const result = await handleSendFile(
-      { file_path: tmpFile },
-      { apiClient: client, config: TEST_CONFIG },
-    );
-    const text = result[0].text;
-    assert.ok(!text.includes('sats'),   'output must not contain "sats"');
+  test('no API client at all is reported, not thrown', async () => {
+    const { filePath } = await makeFile('noapi.bin', 100);
+    const out = parse(await handleSendFile({ file_path: filePath }, {}));
+    assert.equal(out.error, 'send_failed');
   });
+});
 
-  test('vocabulary: no "ecash" in any output', async () => {
-    await setup();
-    const client = makeApiClient();
-    const result = await handleSendFile(
-      { file_path: tmpFile },
-      { apiClient: client, config: TEST_CONFIG },
-    );
-    const text = result[0].text;
-    assert.ok(!text.includes('ecash'),  'output must not contain "ecash"');
-  });
+describe('failures at initiate', () => {
+  const cases = [
+    [402, { code: 'quota_exhausted', rail: 'identity', remaining_credits: 0, shortfall_credits: 110 }, 'payment_required'],
+    [401, { error: 'Credential commitment mismatch' }, 'credential_invalid'],
+    [403, { error: 'Availability scheduling requires a paid subscription' }, 'tier_gate'],
+    [409, { error: 'Credential already spent' }, 'already_complete'],
+    [413, { error: 'Declared total exceeds cap' }, 'too_large'],
+    [503, { error: 'Upload temporarily unavailable' }, 'send_failed'],
+  ];
 
-  test('vocabulary: no "tokens" in any output', async () => {
-    await setup();
-    const client = makeApiClient();
-    const result = await handleSendFile(
-      { file_path: tmpFile },
-      { apiClient: client, config: TEST_CONFIG },
-    );
-    const text = result[0].text;
-    assert.ok(!text.includes('tokens'), 'output must not contain "tokens"');
-  });
-
-  test('vocabulary: no "sats" in payment_required envelope', async () => {
-    await setup();
-    const client = makeApiClient({
-      issueStatus: 402,
-      issueBody: { code: 'overage_ceiling', rail: 'identity', remaining_credits: 0 },
+  for (const [status, body, expected] of cases) {
+    test(`initiate ${status} → ${expected}, nothing uploaded`, async () => {
+      const { filePath } = await makeFile(`init-${status}.bin`, 100);
+      const { out, calls } = await send({ file_path: filePath },
+        { initiateStatus: status, initiateBody: body });
+      assert.equal(out.error, expected, out.detail);
+      assert.equal(calls.puts.length, 0);
+      assert.equal(calls.finalise.length, 0);
     });
-    const result = await handleSendFile(
-      { file_path: tmpFile },
-      { apiClient: client, config: TEST_CONFIG },
-    );
-    const text = result[0].text;
-    assert.ok(!text.includes('sats'),   '"sats" must not appear in payment_required envelope');
-    assert.ok(!text.includes('ecash'),  '"ecash" must not appear in payment_required envelope');
-    assert.ok(!text.includes('tokens'), '"tokens" must not appear in payment_required envelope');
+  }
+
+  test('initiate without a session token stops the send', async () => {
+    const { filePath } = await makeFile('nosession.bin', 100);
+    const { out, calls } = await send({ file_path: filePath }, {
+      initiateBody: {
+        uuid: TEST_UUID, total_chunks: 1, urls: [],
+        tail_url: { index: 0, url: 'https://r2.test/tail/0' },
+      },
+    });
+    assert.equal(out.error, 'send_failed');
+    assert.match(out.detail, /session token/);
+    assert.equal(calls.puts.length, 0);
   });
 
-  // ── Fragment v1 grammar ───────────────────────────────────────────────────
+  test('a tail URL for the wrong index stops the send', async () => {
+    const { filePath } = await makeFile('badtail.bin', 100);
+    const { out, calls } = await send({ file_path: filePath }, {
+      initiateBody: {
+        uuid: TEST_UUID, session_token: 'rfs_test_session', total_chunks: 1, urls: [],
+        tail_url: { index: 7, url: 'https://r2.test/tail/7' },
+      },
+    });
+    assert.equal(out.error, 'send_failed');
+    assert.match(out.detail, /tail URL/);
+    assert.equal(calls.puts.length, 0);
+  });
+});
 
-  test('fragment v1: has v, k, n fields', async () => {
-    await setup();
-    const client = makeApiClient();
-    const result = await handleSendFile(
-      { file_path: tmpFile },
-      { apiClient: client, config: TEST_CONFIG },
-    );
-    const data     = JSON.parse(result[0].text);
-    const fragment = data.share_url.split('#')[1];
-    const parsed   = decodeFragmentV1(fragment);
-
-    assert.equal(parsed.v, 1);
-    assert.ok(typeof parsed.k === 'string' && parsed.k.length > 0, 'k (AES key) present');
-    assert.ok(typeof parsed.n === 'string' && parsed.n.length > 0, 'n (filename) present');
+describe('failures during upload and finalise', () => {
+  test('R2 403 on a part is fatal and is not retried', async () => {
+    const { filePath } = await makeFile('r2403.bin', 100);
+    const { out, calls } = await send({ file_path: filePath }, { putStatus: 403 });
+    assert.equal(out.error, 'part_rejected');
+    assert.equal(out.uuid, TEST_UUID);
+    assert.equal(calls.puts.length, 1, 'a 403 must not be retried');
+    assert.equal(calls.finalise.length, 0, 'never finalise an incomplete set');
   });
 
-  test('fragment v1: AES key is NOT "encrypted-payload"', async () => {
-    await setup();
-    const client = makeApiClient();
-    const result = await handleSendFile(
-      { file_path: tmpFile },
-      { apiClient: client, config: TEST_CONFIG },
-    );
-    const data     = JSON.parse(result[0].text);
-    const fragment = data.share_url.split('#')[1];
-    const parsed   = decodeFragmentV1(fragment);
+  test('finalise 409 incomplete is reported as not collectable, with the missing parts', async () => {
+    const { filePath } = await makeFile('incomplete.bin', 100);
+    const { out } = await send({ file_path: filePath }, {
+      finaliseStatus: 409, finaliseBody: { error: 'incomplete', missing: ['0000'] },
+    });
+    assert.equal(out.error, 'incomplete');
+    assert.deepEqual(out.missing, ['0000']);
+    assert.equal(out.uuid, TEST_UUID);
+  });
 
-    assert.notEqual(parsed.k, 'encrypted-payload', 'k must be the actual AES key, not the placeholder');
-    assert.notEqual(parsed.n, 'encrypted-payload', 'n must be the real filename, not the placeholder');
+  test('finalise 409 already_complete is reported as such', async () => {
+    const { filePath } = await makeFile('already.bin', 100);
+    const { out } = await send({ file_path: filePath }, {
+      finaliseStatus: 409, finaliseBody: { error: 'already_complete' },
+    });
+    assert.equal(out.error, 'already_complete');
+  });
+
+  test('finalise 401 reports an expired session', async () => {
+    const { filePath } = await makeFile('fin401.bin', 100);
+    const { out } = await send({ file_path: filePath }, {
+      finaliseStatus: 401, finaliseBody: { error: 'Invalid or expired upload session' },
+    });
+    assert.equal(out.error, 'session_expired');
+  });
+
+  test('a failed finalise never produces a share URL', async () => {
+    const { filePath } = await makeFile('nourl.bin', 100);
+    const { out } = await send({ file_path: filePath }, {
+      finaliseStatus: 500, finaliseBody: { error: 'Failed to persist chunk hashes' },
+    });
+    assert.equal(out.error, 'finalise_failed');
+    assert.equal(out.share_url, undefined);
+  });
+
+  test('a 401 from /urls on a multi-part send reports an expired session', async () => {
+    // Three parts with batchSize 1: part 0 comes from initiate, part 1 needs /urls.
+    const { filePath } = await makeFile('urls401.bin', 2 * CHUNK_SIZE + 10);
+    const { out, calls } = await send({ file_path: filePath }, { batchSize: 1, urlsStatus: 401 });
+    assert.equal(out.error, 'session_expired');
+    assert.equal(calls.finalise.length, 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Vocabulary
+// ---------------------------------------------------------------------------
+
+describe('vocabulary: credits only', () => {
+  const forbidden = ['sats', 'ecash', 'tokens'];
+
+  test('the happy-path envelope says none of them', async () => {
+    const { filePath } = await makeFile('vocab.bin', 100);
+    const { out } = await send({ file_path: filePath });
+    const text = JSON.stringify(out).toLowerCase();
+    for (const word of forbidden) assert.ok(!text.includes(word), `output said "${word}"`);
+    assert.ok('cost_credits' in out);
+  });
+
+  test('the payment_required envelope says none of them', async () => {
+    const { filePath } = await makeFile('vocab2.bin', 100);
+    const { out } = await send({ file_path: filePath }, {
+      initiateStatus: 402,
+      initiateBody: { code: 'quota_exhausted', rail: 'identity', remaining_credits: 0, shortfall_credits: 110 },
+    });
+    const text = JSON.stringify(out).toLowerCase();
+    for (const word of forbidden) assert.ok(!text.includes(word), `envelope said "${word}"`);
+  });
+
+  test('every error envelope says none of them', async () => {
+    const { filePath } = await makeFile('vocab3.bin', 100);
+    for (const opts of [{ putStatus: 403 }, { finaliseStatus: 500 }, { initiateStatus: 413 }]) {
+      const { out } = await send({ file_path: filePath }, opts);
+      const text = JSON.stringify(out).toLowerCase();
+      for (const word of forbidden) assert.ok(!text.includes(word), `${JSON.stringify(opts)} said "${word}"`);
+    }
   });
 });

@@ -35,29 +35,40 @@ test('costCredits: 1 byte → 100 storage credits (ceiling to first GB)', () => 
   assert.equal(r.total, 110);
 });
 
-test('costCredits: exactly 1 GB → 100 storage credits', () => {
-  const r = costCredits({ sizeBytes: 1_000_000_000 });
+// MCP-Fix-1: a GB band is a GiB (1024³), matching the Worker's
+// computeTransferCost — that is the number actually debited at /initiate.
+const GIB = 1024 * 1024 * 1024;
+
+test('costCredits: exactly 1 GiB → 100 storage credits', () => {
+  const r = costCredits({ sizeBytes: GIB });
   assert.equal(r.storage, 100);
   assert.equal(r.total, 110);
 });
 
-test('costCredits: 1 GB + 1 byte → 200 storage credits (ceiling to second GB)', () => {
-  const r = costCredits({ sizeBytes: 1_000_000_001 });
+test('costCredits: 1 GiB + 1 byte → 200 storage credits (ceiling to the second band)', () => {
+  const r = costCredits({ sizeBytes: GIB + 1 });
   assert.equal(r.storage, 200);
   assert.equal(r.total, 210);
 });
 
-test('costCredits: 5 GB exactly → 500 storage credits', () => {
-  const r = costCredits({ sizeBytes: 5_000_000_000 });
+test('costCredits: 5 GiB exactly → 500 storage credits', () => {
+  const r = costCredits({ sizeBytes: 5 * GIB });
   assert.equal(r.storage, 500);
   assert.equal(r.total, 510);
 });
 
-test('costCredits: 1.4 GB → 200 storage credits (ceiling)', () => {
-  // 1.4 GB = 1,400,000,000 bytes → ceil(1.4) = 2 → 200 credits
-  const r = costCredits({ sizeBytes: 1_400_000_000 });
+test('costCredits: 1.4 GiB → 200 storage credits (ceiling)', () => {
+  const r = costCredits({ sizeBytes: Math.round(1.4 * GIB) });
   assert.equal(r.storage, 200);
   assert.equal(r.total, 210);
+});
+
+test('costCredits: a decimal GB is still one band — the Worker charges per GiB', () => {
+  // 1e9 bytes is less than 1 GiB, so it is one band, not two.
+  // This is the divergence MCP-Fix-1 closed: the quote now matches the debit.
+  const r = costCredits({ sizeBytes: 1_000_000_000 });
+  assert.equal(r.storage, 100);
+  assert.equal(r.total, 110);
 });
 
 // ---------------------------------------------------------------------------

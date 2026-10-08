@@ -3,7 +3,13 @@
  *
  * Matches frontend/crypto.js and frontend/upload.js behaviour exactly.
  *
- * AAD per chunk: 4-byte big-endian uint32 via DataView.setUint32(0, i, false).
+ * Link format v2 (MCP-Fix-1): parts are encrypted under a key derived from the
+ * transfer key K with HKDF-SHA256, with a STREAM counter nonce per part — never
+ * K directly, never a per-part random IV. See the part-crypto block below. The
+ * reference implementation is frontend/crypto.js (derivePartKey / encryptPart);
+ * known-answer vectors live in refueler-share worker/test/part-crypto.test.js.
+ *
+ * AAD per part: 4-byte big-endian uint32 via DataView.setUint32(0, i, false).
  * This is load-bearing — wrong AAD = silent corruption downstream. Do not alter.
  *
  * BLAKE3 = chunk integrity only. Not the auth layer. Not the passphrase hash.
@@ -20,11 +26,19 @@ import { blake3 } from '@noble/hashes/blake3.js';
 // Constants
 // ---------------------------------------------------------------------------
 
-/** Default chunk size: 8 MiB — matches frontend/upload.js */
-export const DEFAULT_CHUNK_SIZE = 8 * 1024 * 1024;
+/**
+ * Part size: 32 MiB — must equal frontend/crypto.js CHUNK_SIZE and the Worker's
+ * sweep_rules CHUNK_SIZE. /initiate 400s unless
+ * total_chunks === ceil(total_bytes / CHUNK_SIZE), so this is load-bearing on the
+ * wire, not a local preference.
+ */
+export const CHUNK_SIZE = 32 * 1024 * 1024;
 
-/** AES-GCM IV length in bytes */
-const IV_LENGTH = 12;
+/** Back-compat alias. Prefer CHUNK_SIZE. */
+export const DEFAULT_CHUNK_SIZE = CHUNK_SIZE;
+
+/** AES-GCM auth tag in bytes — a stored part is plaintext length + this. */
+export const CHUNK_TAG_BYTES = 16;
 
 /** AES-GCM auth tag length in bits */
 const TAG_LENGTH_BITS = 128;
@@ -46,109 +60,78 @@ export function generateAesKey() {
   return key;
 }
 
-// ---------------------------------------------------------------------------
-// AES-GCM encryption / decryption
-// ---------------------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
+// Part crypto — link format v2 (Share-Crypto-1). Twin of frontend/crypto.js
+// derivePartKey / partNonce / partAad / encryptPart / decryptPart. Keep them
+// byte-identical: a divergence here produces parts the browser cannot decrypt.
+//
+//   part_key = HKDF-SHA256(K, salt = empty, info = utf8("refueler.share.payload.v2") ‖ 0x00)
+//   nonce_i  = 0x00 ×7 ‖ BE32(i) ‖ last   (last = 0x01 on part N−1, else 0x00)
+//   AAD_i    = BE32(i)
+// Stored part = AES-256-GCM(part_key, nonce_i, AAD_i, P_i) = ciphertext ‖ 16-byte tag.
+//
+// Every part under one key gets its own nonce (the counter), and the last-part
+// flag means a reordered, dropped or appended part fails its tag. There is no IV
+// in the stored object — v2 links carry no `i` field, and the presigned PUT signs
+// content-length = CHUNK_SIZE + 16 exactly, so a prefixed IV would be rejected.
+//
+// The date seal stays on K itself with its own random IV (timestamp path).
+// Links before v2 are a receiver concern only — senders make v2 and nothing else.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const _PAYLOAD_INFO = new Uint8Array([
+  ...new TextEncoder().encode('refueler.share.payload.v2'), 0x00,
+]);
 
 /**
- * encryptChunk(keyBytes, chunkIndex, plaintextBuffer) → Promise<Uint8Array>
- *
- * Encrypts a single chunk with AES-256-GCM.
- *
- * AAD = 4-byte big-endian uint32(chunkIndex).
- * Matches DataView.setUint32(0, i, false) in frontend/crypto.js exactly.
- *
- * IV = 12 random bytes prepended to the ciphertext.
- * Output layout: [ IV (12 bytes) | ciphertext | auth tag (16 bytes) ]
- *
- * @param {Uint8Array}        keyBytes       — 32-byte AES key
- * @param {number}            chunkIndex     — zero-based chunk index (uint32)
- * @param {Uint8Array|Buffer} plaintextBuffer
- * @returns {Promise<Uint8Array>}
+ * derivePartKey(kBytes, usages) → Promise<CryptoKey>
+ * K (32 bytes) → AES-GCM key for parts. usages: ['encrypt'] or ['decrypt'].
  */
-export async function encryptChunk(keyBytes, chunkIndex, plaintextBuffer) {
-  if (!(keyBytes instanceof Uint8Array) || keyBytes.length !== 32) {
-    throw new TypeError('keyBytes must be a 32-byte Uint8Array');
-  }
-  if (!Number.isInteger(chunkIndex) || chunkIndex < 0 || chunkIndex > 0xFFFFFFFF) {
-    throw new RangeError('chunkIndex must be a non-negative uint32');
-  }
-
-  // AAD: 4-byte big-endian uint32 — load-bearing, must match frontend exactly
-  const aad = new Uint8Array(4);
-  new DataView(aad.buffer).setUint32(0, chunkIndex, false); // false = big-endian
-
-  // Random 12-byte IV
-  const iv = new Uint8Array(IV_LENGTH);
-  randomFillSync(iv);
-
-  const cryptoKey = await globalThis.crypto.subtle.importKey(
-    'raw',
-    keyBytes,
-    { name: 'AES-GCM' },
-    false,
-    ['encrypt'],
+export async function derivePartKey(kBytes, usages) {
+  const k = kBytes instanceof Uint8Array ? kBytes : new Uint8Array(kBytes);
+  if (k.length !== 32) throw new TypeError('derivePartKey: K must be 32 bytes');
+  const ikm = await globalThis.crypto.subtle.importKey('raw', k, 'HKDF', false, ['deriveKey']);
+  return globalThis.crypto.subtle.deriveKey(
+    { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: _PAYLOAD_INFO },
+    ikm, { name: 'AES-GCM', length: 256 }, false, usages,
   );
+}
 
-  const ciphertextWithTag = await globalThis.crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv, additionalData: aad, tagLength: TAG_LENGTH_BITS },
-    cryptoKey,
-    plaintextBuffer instanceof Uint8Array ? plaintextBuffer : new Uint8Array(plaintextBuffer),
-  );
+/** 12-byte nonce for part i; last = true on the final part. */
+export function partNonce(i, last) {
+  const n = new Uint8Array(12);
+  new DataView(n.buffer).setUint32(7, i, false);
+  n[11] = last ? 1 : 0;
+  return n;
+}
 
-  // Output: [ IV (12) | ciphertext+tag ]
-  const output = new Uint8Array(IV_LENGTH + ciphertextWithTag.byteLength);
-  output.set(iv, 0);
-  output.set(new Uint8Array(ciphertextWithTag), IV_LENGTH);
-  return output;
+/** 4-byte AAD for part i (BE uint32 = object index = Merkle leaf index). */
+export function partAad(i) {
+  const a = new Uint8Array(4);
+  new DataView(a.buffer).setUint32(0, i, false);
+  return a;
+}
+
+/** Encrypt part i of n → Uint8Array (ciphertext ‖ tag). */
+export async function encryptPart(partKey, raw, i, n) {
+  return new Uint8Array(await globalThis.crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv: partNonce(i, i === n - 1), additionalData: partAad(i), tagLength: TAG_LENGTH_BITS },
+    partKey,
+    raw instanceof Uint8Array ? raw : new Uint8Array(raw),
+  ));
 }
 
 /**
- * decryptChunk(keyBytes, chunkIndex, encryptedBuffer) → Promise<Uint8Array>
- *
- * Inverse of encryptChunk. Used in round-trip tests and by the download path.
- * Will throw (DOMException) if the auth tag fails — caller must treat this as
- * an integrity failure and abort, never silently discard.
- *
- * @param {Uint8Array}        keyBytes
- * @param {number}            chunkIndex
- * @param {Uint8Array|Buffer} encryptedBuffer — [ IV (12) | ciphertext+tag ]
- * @returns {Promise<Uint8Array>}
+ * Decrypt part i of n → Uint8Array. Throws if the part, its index or its place
+ * as last doesn't check out — the caller must treat that as an integrity
+ * failure and abort, never silently discard.
  */
-export async function decryptChunk(keyBytes, chunkIndex, encryptedBuffer) {
-  if (!(keyBytes instanceof Uint8Array) || keyBytes.length !== 32) {
-    throw new TypeError('keyBytes must be a 32-byte Uint8Array');
-  }
-
-  const buf = encryptedBuffer instanceof Uint8Array
-    ? encryptedBuffer
-    : new Uint8Array(encryptedBuffer);
-
-  if (buf.length < IV_LENGTH + 16) {
-    throw new RangeError('encryptedBuffer too short to contain IV + auth tag');
-  }
-
-  const iv = buf.slice(0, IV_LENGTH);
-  const ciphertextWithTag = buf.slice(IV_LENGTH);
-
-  const aad = new Uint8Array(4);
-  new DataView(aad.buffer).setUint32(0, chunkIndex, false);
-
-  const cryptoKey = await globalThis.crypto.subtle.importKey(
-    'raw',
-    keyBytes,
-    { name: 'AES-GCM' },
-    false,
-    ['decrypt'],
-  );
-
-  const plaintext = await globalThis.crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv, additionalData: aad, tagLength: TAG_LENGTH_BITS },
-    cryptoKey,
-    ciphertextWithTag,
-  );
-
-  return new Uint8Array(plaintext);
+export async function decryptPart(partKey, ct, i, n) {
+  return new Uint8Array(await globalThis.crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: partNonce(i, i === n - 1), additionalData: partAad(i), tagLength: TAG_LENGTH_BITS },
+    partKey,
+    ct instanceof Uint8Array ? ct : new Uint8Array(ct),
+  ));
 }
 
 // ---------------------------------------------------------------------------
@@ -174,36 +157,11 @@ export function blake3Chunk(chunkBuffer) {
   return blake3(buf);
 }
 
-/**
- * blake3Root(chunkHashes) → Uint8Array (32 bytes)
- *
- * Rolling BLAKE3 root from an array of per-chunk hashes.
- * Matches frontend/crypto.js: concatenate all 32-byte chunk hashes in order,
- * then BLAKE3-hash the concatenation.
- *
- * Note: full Merkle-tree verification is blocked until B9. This value proves
- * the chunk set was consistent at upload time; it does not prove end-to-end
- * file integrity on its own.
- *
- * @param {Uint8Array[]} chunkHashes — ordered array of 32-byte hashes
- * @returns {Uint8Array} 32-byte root hash
- */
-export function blake3Root(chunkHashes) {
-  if (!Array.isArray(chunkHashes) || chunkHashes.length === 0) {
-    throw new TypeError('chunkHashes must be a non-empty array');
-  }
-
-  const concat = new Uint8Array(chunkHashes.length * 32);
-  for (let i = 0; i < chunkHashes.length; i++) {
-    const h = chunkHashes[i];
-    if (!(h instanceof Uint8Array) || h.length !== 32) {
-      throw new TypeError(`chunkHashes[${i}] must be a 32-byte Uint8Array`);
-    }
-    concat.set(h, i * 32);
-  }
-
-  return blake3Chunk(concat);
-}
+// NOTE: there is no blake3Root() here any more. The transfer's root is the
+// RFC 6962 unbalanced ciphertext-chunk Merkle root from src/merkle.js — that is
+// what POST /upload/:uuid/finalise records and what the Worker reconstructs
+// before it serves a download. The old rolling concat-then-hash root matched
+// nothing the Worker reads.
 
 // ---------------------------------------------------------------------------
 // File chunking
@@ -295,6 +253,93 @@ export async function hashSecret(passphrase) {
   return Array.from(new Uint8Array(hash))
     .map(b => b.toString(16).padStart(2, '0'))
     .join('');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Credential format v2 — a standard Cashu proof { id, amount: 1, secret, C }.
+// Twin of frontend/crypto.js generateBlindedCredential / unblindSignature.
+// Worker side: verifyProofV2 in worker/src/nut00.js (Y = hash_to_curve(utf8(secret)),
+// k·Y == C, serial = hex(Y)). Anything else is a 401 and nothing is spent.
+//
+// @cashu/cashu-ts is pinned to the EXACT version the Worker and the browser run
+// (4.11.0 — worker/package.json and bin/vendor-cashu.sh). Upgrade all three
+// together. No hand-rolled curve maths here or anywhere (locked decision).
+// ─────────────────────────────────────────────────────────────────────────────
+
+import {
+  blindMessage as _cashuBlindMessage,
+  unblindSignature as _cashuUnblindSignature,
+  verifyDLEQProof as _cashuVerifyDLEQProof,
+  pointFromHex as _cashuPointFromHex,
+} from '@cashu/cashu-ts';
+
+/** Thrown when the issue response's NUT-12 DLEQ proof does not check out. */
+export class CredentialProofError extends Error {
+  constructor(message) { super(message); this.name = 'CredentialProofError'; }
+}
+
+/**
+ * Step 1 → { blindedMsg, blindingFactor, secret }. Keep the result until step 2.
+ * secret: 64-hex of 32 random bytes; its UTF-8 bytes are hashed to the curve (NUT-00).
+ */
+export function generateBlindedCredential() {
+  const secretBytes = new Uint8Array(32);
+  randomFillSync(secretBytes);
+  const secret = bufToHex(secretBytes);
+  const { B_, r } = _cashuBlindMessage(new TextEncoder().encode(secret));
+  return {
+    blindedMsg:     B_.toHex(true),
+    blindingFactor: r.toString(16).padStart(64, '0'),
+    secret,
+  };
+}
+
+/**
+ * Step 2. issued = the /credential/issue JSON ({ signed_point, mint_pubkey, keyset_id, dleq }),
+ * blinded = generateBlindedCredential()'s result. Checks the NUT-12 DLEQ proof (the
+ * signature matches the key it came with — the key is not pinned until the anonymous
+ * rail), then unblinds.
+ *
+ * → JSON string for X-Cashu-Credential. Throws CredentialProofError on a bad or
+ * missing proof, before anything is spent.
+ */
+export function unblindSignature(issued, blinded) {
+  const { signed_point, mint_pubkey, keyset_id, dleq } = issued || {};
+  if (!signed_point || !mint_pubkey || !keyset_id || !dleq?.e || !dleq?.s) {
+    throw new CredentialProofError('Credential issue response missing signature, keyset id or DLEQ proof');
+  }
+  let C_, K, verified = false;
+  try {
+    C_ = _cashuPointFromHex(signed_point);
+    K  = _cashuPointFromHex(mint_pubkey);
+    const B_ = _cashuPointFromHex(blinded.blindedMsg);
+    const proof = { e: hexToBuf(dleq.e), s: hexToBuf(dleq.s) };
+    verified = _cashuVerifyDLEQProof(proof, B_, C_, K);
+  } catch {
+    // malformed point or out-of-range scalar — the library throws rather than returning false
+  }
+  if (!verified) throw new CredentialProofError('Credential DLEQ proof did not verify');
+  const C = _cashuUnblindSignature(C_, BigInt('0x' + blinded.blindingFactor), K);
+  return JSON.stringify({ id: keyset_id, amount: 1, secret: blinded.secret, C: C.toHex(true) });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Byte helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Uint8Array | ArrayBuffer → lowercase hex. */
+export function bufToHex(buf) {
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+/** Lowercase or uppercase hex → Uint8Array. */
+export function hexToBuf(hex) {
+  if (typeof hex !== 'string' || hex.length % 2 !== 0 || /[^0-9a-fA-F]/.test(hex)) {
+    throw new TypeError('hexToBuf: not an even-length hex string');
+  }
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  return out;
 }
 
 // =============================================================================

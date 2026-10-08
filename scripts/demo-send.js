@@ -14,6 +14,11 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { join, dirname } from 'node:path';
 
+import { createApiClient } from '../src/api.js';
+import { refuelerQuote } from '../src/tools/quote.js';
+import { handleSendFile } from '../src/tools/send.js';
+import { handleCheckTransfer } from '../src/tools/check.js';
+
 // ---------------------------------------------------------------------------
 // Terminal styling — Carbon/Paper palette, graceful on any terminal
 // ---------------------------------------------------------------------------
@@ -66,44 +71,36 @@ try {
 }
 
 // ---------------------------------------------------------------------------
-// Dynamically import the MCP tool implementations from src/
-// We call the underlying tool handlers directly — no MCP transport needed.
-// ---------------------------------------------------------------------------
-const srcDir = join(__dir, '..', 'src');
-
-let quoteHandler, sendHandler, checkHandler;
-try {
-  const quoteMod  = await import(join(srcDir, 'tools', 'quote.js'));
-  const sendMod   = await import(join(srcDir, 'tools', 'send.js'));
-  const checkMod  = await import(join(srcDir, 'tools', 'check.js'));
-  quoteHandler = quoteMod.handler  ?? quoteMod.default;
-  sendHandler  = sendMod.handler   ?? sendMod.default;
-  checkHandler = checkMod.handler  ?? checkMod.default;
-} catch (err) {
-  fatal(`Failed to import tool modules: ${err.message}`);
-}
-
-// ---------------------------------------------------------------------------
-// Config object (mirrors what src/config.js exposes at runtime)
+// Config + client — the same shapes src/index.js builds at runtime.
+// MCP-Fix-1: this script used to reach for a `handler` / `default` export that
+// no tool module has, and to pass a config object where the handlers want
+// { api, config }. It therefore died on its first tool call. Fixed here.
 // ---------------------------------------------------------------------------
 const config = {
-  apiKey:  LIVE_KEY,
+  liveKey: LIVE_KEY,
   signKey: SIGN_KEY,
-  baseUrl: 'https://api.share.refueler.io',
+  apiBase: (process.env.REFUELER_API_BASE ?? 'https://api.share.refueler.io').replace(/\/$/, ''),
+  rail:    'identity',
 };
+const api  = createApiClient(config);
+const deps = { api, apiClient: api, config };
 
 // ---------------------------------------------------------------------------
-// Helper: call a tool handler and unwrap the MCP content array
+// Helper: call a tool handler and unwrap whatever shape it returns.
+// quote/balance return a plain object; send/check return a content array;
+// capabilities returns a full MCP result. Same normalising as src/index.js.
 // ---------------------------------------------------------------------------
 async function callTool(handler, args) {
-  // Tool handlers return { content: [{ type: 'text', text: '...' }] }
-  // or throw on hard errors.
-  const result = await handler(args, config);
-  if (!result || !result.content || !result.content.length) {
-    throw new Error('Tool returned empty content');
-  }
-  const text = result.content.map((c) => (c.type === 'text' ? c.text : '')).join('');
-  // Parse JSON if possible; fall back to raw text
+  const result = await handler(args, deps);
+  if (!result) throw new Error('Tool returned nothing');
+
+  const content = Array.isArray(result) ? result
+    : Array.isArray(result.content)     ? result.content
+    : null;
+  if (!content) return result;              // plain object (quote, balance)
+  if (!content.length) throw new Error('Tool returned empty content');
+
+  const text = content.map((c) => (c.type === 'text' ? c.text : '')).join('');
   try {
     return JSON.parse(text);
   } catch {
@@ -129,7 +126,7 @@ console.log();
 
 let quote;
 try {
-  quote = await callTool(quoteHandler, {
+  quote = await callTool(refuelerQuote, {
     size_bytes:       sizeBytes,
     permanent_record: false,
     rail:             'identity',
@@ -164,11 +161,7 @@ console.log();
 
 let send;
 try {
-  send = await callTool(sendHandler, {
-    file_path:        payloadPath,
-    expires_in_hours: 24,
-    permanent_record: false,
-  });
+  send = await callTool(handleSendFile, { file_path: payloadPath });
 } catch (err) {
   fatal(`Send failed: ${err.message}`);
 }
@@ -203,9 +196,9 @@ console.log();
 label('share_url',    send.share_url);
 label('cost_credits', `${send.cost_credits} credits`);
 label('expires_at',   send.expires_at ?? '—');
-if (send.transfer_id) {
-  label('transfer_id',  send.transfer_id);
-}
+label('uuid',         send.uuid);
+label('parts',        send.total_parts);
+label('merkle_root',  send.merkle_root);
 
 // ---------------------------------------------------------------------------
 // Step 3 — Check transfer state
@@ -214,15 +207,10 @@ console.log();
 console.log(C.bold + '  Step 3 · Check transfer state' + C.reset);
 console.log();
 
-// The check tool needs a share_url or transfer_id.
-// Try transfer_id first; fall back to share_url if the tool accepts it.
-const checkArgs = send.transfer_id
-  ? { transfer_id: send.transfer_id }
-  : { share_url: send.share_url };
-
+// refueler_check_transfer takes the transfer uuid, which send returns.
 let check;
 try {
-  check = await callTool(checkHandler, checkArgs);
+  check = await callTool(handleCheckTransfer, { uuid: send.uuid });
 } catch (err) {
   // Non-fatal — the transfer was sent; check is a bonus
   warn(`State check failed: ${err.message}`);

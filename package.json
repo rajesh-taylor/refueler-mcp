@@ -5,11 +5,12 @@
   "license": "Apache-2.0",
   "private": false,
   "main": "src/index.js",
+  "type": "module",
   "bin": {
     "refueler-mcp": "src/index.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "files": [
     "src/",
@@ -36,15 +37,12 @@
     "url": "https://github.com/rajesh-taylor/refueler-mcp/issues"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.30.0",
-    "@noble/hashes": "^1.4.0",
-    "@noble/secp256k1": "^2.1.0",
-    "dotenv": "^16.4.0"
-  },
-  "devDependencies": {
-    "vitest": "^2.0.0"
+    "@cashu/cashu-ts": "4.11.0",
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "@noble/curves": "^2.4.0",
+    "@noble/hashes": "^1.4.0"
   },
   "scripts": {
-    "test": "vitest run"
+    "test": "node --test 'test/*.test.js'"
   }
 }

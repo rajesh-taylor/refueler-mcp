@@ -52,9 +52,13 @@ const MOCK_CAPABILITIES = {
     stale: false,
   },
   limits: {
-    max_transfer_bytes: 250000000000,
-    chunk_bytes: 8388608,
-    max_chunk_bytes: 10485760,
+    // MCP-Fix-1: the cap the Worker actually enforces at /initiate —
+    // CHARTERED_CAP_BYTES = TIER_CAPS.free = 4 GiB until B12-4a (KV-Fix-1a).
+    // Never the 250 GB the spec's illustrative value showed.
+    max_transfer_bytes: 4294967296,
+    max_file_size_gb: 4,
+    // 32 MiB — frontend/crypto.js CHUNK_SIZE and the Worker's sweep_rules CHUNK_SIZE.
+    chunk_bytes: 33554432,
   },
 };
 

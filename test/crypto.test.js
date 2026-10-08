@@ -4,6 +4,11 @@
  * node:test only — no vitest, no jest, no mocha.
  * Test credentials use rfs_test_ prefix per CLAUDE.md.
  *
+ * Part encryption (derivePartKey / encryptPart / decryptPart) and the v2 fragment
+ * are covered by test/part-crypto.test.js against the vectors shared with
+ * refueler-share. The Merkle root is covered by test/merkle.test.js. This file
+ * holds what is left: key generation, the chunk digest, chunking and hashSecret.
+ *
  * Run: node --test test/crypto.test.js
  */
 
@@ -15,13 +20,10 @@ import { tmpdir } from 'node:os';
 
 import {
   generateAesKey,
-  encryptChunk,
-  decryptChunk,
   blake3Chunk,
-  blake3Root,
   chunkFile,
   hashSecret,
-  DEFAULT_CHUNK_SIZE,
+  CHUNK_SIZE,
 } from '../src/crypto.js';
 
 // ---------------------------------------------------------------------------
@@ -40,116 +42,6 @@ describe('generateAesKey', () => {
     const b = generateAesKey();
     // Probability of collision: 2^-256 — safe to assert
     assert.notDeepEqual(a, b, 'consecutive keys must differ');
-  });
-});
-
-// ---------------------------------------------------------------------------
-// encryptChunk / decryptChunk — round-trip
-// ---------------------------------------------------------------------------
-
-describe('encryptChunk / decryptChunk round-trip', () => {
-  it('encrypts and decrypts a chunk correctly', async () => {
-    const key = generateAesKey();
-    const plaintext = new TextEncoder().encode('rfs_test_hello_world');
-
-    const encrypted = await encryptChunk(key, 0, plaintext);
-    assert.ok(encrypted instanceof Uint8Array, 'encrypted should be Uint8Array');
-    // IV (12) + ciphertext (20) + tag (16) = 48
-    assert.equal(encrypted.length, 12 + plaintext.length + 16);
-
-    const decrypted = await decryptChunk(key, 0, encrypted);
-    assert.deepEqual(decrypted, plaintext, 'decrypted must equal original plaintext');
-  });
-
-  it('round-trips a large binary buffer', async () => {
-    const key = generateAesKey();
-    // 1 MiB of pseudo-random-ish data (deterministic for test reproducibility)
-    const plaintext = new Uint8Array(1024 * 1024);
-    for (let i = 0; i < plaintext.length; i++) plaintext[i] = i & 0xFF;
-
-    const encrypted = await encryptChunk(key, 3, plaintext);
-    const decrypted = await decryptChunk(key, 3, encrypted);
-    assert.deepEqual(decrypted, plaintext, 'large buffer round-trip must match');
-  });
-
-  it('round-trips an empty buffer', async () => {
-    const key = generateAesKey();
-    const plaintext = new Uint8Array(0);
-    const encrypted = await encryptChunk(key, 0, plaintext);
-    const decrypted = await decryptChunk(key, 0, encrypted);
-    assert.deepEqual(decrypted, plaintext, 'empty buffer round-trip must match');
-  });
-
-  it('handles chunk index at uint32 boundary (0xFFFFFFFF)', async () => {
-    const key = generateAesKey();
-    const plaintext = new TextEncoder().encode('boundary');
-    const encrypted = await encryptChunk(key, 0xFFFFFFFF, plaintext);
-    const decrypted = await decryptChunk(key, 0xFFFFFFFF, encrypted);
-    assert.deepEqual(decrypted, plaintext, 'max uint32 index round-trip must match');
-  });
-});
-
-// ---------------------------------------------------------------------------
-// AAD correctness — wrong chunk index must fail decryption
-// ---------------------------------------------------------------------------
-
-describe('AAD correctness', () => {
-  it('fails decryption when chunk index is wrong (AAD mismatch)', async () => {
-    const key = generateAesKey();
-    const plaintext = new TextEncoder().encode('rfs_test_aad_check');
-
-    // Encrypt with index 0
-    const encrypted = await encryptChunk(key, 0, plaintext);
-
-    // Attempt to decrypt as index 1 — AAD mismatch must cause auth-tag failure
-    await assert.rejects(
-      () => decryptChunk(key, 1, encrypted),
-      (err) => {
-        // AES-GCM auth failure surfaces as DOMException or OperationError
-        // depending on the Node/WebCrypto version
-        return (
-          err instanceof Error ||
-          (typeof DOMException !== 'undefined' && err instanceof DOMException)
-        );
-      },
-      'wrong chunk index must cause decryption to reject',
-    );
-  });
-
-  it('fails decryption when the key is wrong', async () => {
-    const key1 = generateAesKey();
-    const key2 = generateAesKey();
-    const plaintext = new TextEncoder().encode('rfs_test_wrong_key');
-
-    const encrypted = await encryptChunk(key1, 0, plaintext);
-
-    await assert.rejects(
-      () => decryptChunk(key2, 0, encrypted),
-      (err) => err instanceof Error,
-      'wrong key must cause decryption to reject',
-    );
-  });
-
-  it('big-endian AAD: index 1 is 0x00000001, not 0x01000000', async () => {
-    const key = generateAesKey();
-    const plaintext = new TextEncoder().encode('rfs_test_endian');
-
-    // Encrypt with index 1
-    const encrypted = await encryptChunk(key, 1, plaintext);
-
-    // Manually build the little-endian equivalent of index 1
-    // and verify it does NOT decrypt correctly (i.e. big-endian is enforced)
-    // We do this by re-encrypting with a patched AAD and checking mismatch.
-    // Easier: just verify the correct big-endian path decrypts fine.
-    const decrypted = await decryptChunk(key, 1, encrypted);
-    assert.deepEqual(decrypted, plaintext, 'big-endian AAD round-trip must succeed');
-
-    // And wrong index must still fail
-    await assert.rejects(
-      () => decryptChunk(key, 0, encrypted),
-      (err) => err instanceof Error,
-      'mismatched index (endian test) must reject',
-    );
   });
 });
 
@@ -195,52 +87,6 @@ describe('blake3Chunk', () => {
 });
 
 // ---------------------------------------------------------------------------
-// blake3Root — rolling root from chunk hashes
-// ---------------------------------------------------------------------------
-
-describe('blake3Root', () => {
-  it('returns a 32-byte Uint8Array', () => {
-    const h = blake3Chunk(new TextEncoder().encode('rfs_test_root'));
-    const root = blake3Root([h]);
-    assert.ok(root instanceof Uint8Array);
-    assert.equal(root.length, 32);
-  });
-
-  it('is deterministic for the same chunk hashes', () => {
-    const h1 = blake3Chunk(new TextEncoder().encode('rfs_test_chunk_1'));
-    const h2 = blake3Chunk(new TextEncoder().encode('rfs_test_chunk_2'));
-    const r1 = blake3Root([h1, h2]);
-    const r2 = blake3Root([h1, h2]);
-    assert.deepEqual(r1, r2, 'same chunk hashes must produce same root');
-  });
-
-  it('differs when chunk order changes', () => {
-    const h1 = blake3Chunk(new TextEncoder().encode('rfs_test_chunk_a'));
-    const h2 = blake3Chunk(new TextEncoder().encode('rfs_test_chunk_b'));
-    const rAB = blake3Root([h1, h2]);
-    const rBA = blake3Root([h2, h1]);
-    assert.notDeepEqual(rAB, rBA, 'different chunk order must produce different root');
-  });
-
-  it('throws on empty array', () => {
-    assert.throws(
-      () => blake3Root([]),
-      /non-empty array/,
-      'empty array must throw',
-    );
-  });
-
-  it('throws when a hash is not 32 bytes', () => {
-    const badHash = new Uint8Array(16); // wrong length
-    assert.throws(
-      () => blake3Root([badHash]),
-      /32-byte Uint8Array/,
-      'non-32-byte hash must throw',
-    );
-  });
-});
-
-// ---------------------------------------------------------------------------
 // chunkFile
 // ---------------------------------------------------------------------------
 
@@ -257,7 +103,7 @@ describe('chunkFile', async () => {
     await writeFile(filePath, content);
 
     const chunks = [];
-    for await (const chunk of chunkFile(filePath, DEFAULT_CHUNK_SIZE)) {
+    for await (const chunk of chunkFile(filePath, CHUNK_SIZE)) {
       chunks.push(chunk);
     }
 

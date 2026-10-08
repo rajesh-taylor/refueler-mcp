@@ -10,14 +10,25 @@ export const RATE_CARD_VERSION = 'v1.0';
 // Transfer fixed cost in credits.
 const TRANSFER_CREDITS = 10;
 
-// Storage cost per full or partial GB in credits.
+// Storage cost per full or partial GB band in credits.
 const STORAGE_CREDITS_PER_GB = 100;
 
 // Permanent-record surcharge in credits.
 const PERMANENT_RECORD_CREDITS = 20;
 
-// Bytes in one gigabyte (decimal — matching cost formula in spec §2.2).
-const BYTES_PER_GB = 1_000_000_000;
+// Bytes in one GB band — BINARY (GiB), 1024³.
+//
+// MCP-Fix-1 (Rajesh, 8 Oct 2026): match what the Worker actually charges.
+// worker/src/r2_presign.js computeTransferCost() divides by 1024³ and that is
+// the number debited from the credit pool at /initiate. This file previously
+// used decimal 1e9 "matching spec §2.2", which made the quote disagree with the
+// invoice: a 1.0 GiB file quoted 210 credits and was charged 110. A quote that
+// does not match the debit is worse than a spec typo, so the Worker wins and
+// the spec is corrected to say GiB.
+//
+// If the Worker's GIB constant ever changes, change this with it, in the same
+// session. The two are one decision.
+const BYTES_PER_GB = 1024 * 1024 * 1024;
 
 /**
  * costCredits({ sizeBytes, permanentRecord })

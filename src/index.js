@@ -1,18 +1,21 @@
+#!/usr/bin/env node
 /**
  * refueler-mcp/src/index.js — MCP server entry point
  *
- * Tools registered (SW-MCP-1 through SW-MCP-5):
- *   refueler_capabilities  — SW-MCP-1
- *   refueler_quote         — SW-MCP-3
- *   refueler_balance       — SW-MCP-3
- *   refueler_send_file     — SW-MCP-4
+ * Tools registered:
+ *   refueler_capabilities   — SW-MCP-1
+ *   refueler_quote          — SW-MCP-3
+ *   refueler_balance        — SW-MCP-3
+ *   refueler_send_file      — SW-MCP-4, rebuilt for the direct-to-R2 path at MCP-Fix-1
  *   refueler_check_transfer — SW-MCP-5
  *
  * Full path: /Users/rajeshtaylor/Documents/refueler-mcp/src/index.js
  * NOT refueler-share/worker/src/index.js — different repo entirely.
+ *
+ * The three tool modules return three different shapes (a full MCP result, a
+ * content array, or a plain object). toResult() below normalises them, so a
+ * handler can keep whichever shape its own tests pin.
  */
-
-'use strict';
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -21,51 +24,36 @@ import {
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 
-import { ApiClient } from './api-client.js';
-import { signRequest } from './hmac.js';
+import { createApiClient } from './api.js';
+import { loadConfig } from './config.js';
 
 // ── Tool definitions + handlers ──────────────────────────────────────────────
 
-import {
-  CAPABILITIES_TOOL_DEFINITION,
-  handleCapabilities,
-} from './tools/capabilities.js';
-
-import {
-  QUOTE_TOOL_DEFINITION,
-  handleQuote,
-} from './tools/quote.js';
-
-import {
-  BALANCE_TOOL_DEFINITION,
-  handleBalance,
-} from './tools/balance.js';
-
-import {
-  SEND_FILE_TOOL_DEFINITION,
-  handleSendFile,
-} from './tools/send.js';
-
-import {
-  CHECK_TOOL_DEFINITION,
-  handleCheckTransfer,
-} from './tools/check.js';
+import { capabilitiesTool,  handleCapabilities }   from './tools/capabilities.js';
+import { quoteTool,         refuelerQuote }        from './tools/quote.js';
+import { balanceTool,       refuelerBalance }      from './tools/balance.js';
+import { sendFileTool,      handleSendFile }       from './tools/send.js';
+import { CHECK_TOOL_DEFINITION, handleCheckTransfer } from './tools/check.js';
 
 // ── Tool registry ─────────────────────────────────────────────────────────────
 
 const TOOLS = [
-  CAPABILITIES_TOOL_DEFINITION,
-  QUOTE_TOOL_DEFINITION,
-  BALANCE_TOOL_DEFINITION,
-  SEND_FILE_TOOL_DEFINITION,
+  capabilitiesTool,
+  quoteTool,
+  balanceTool,
+  sendFileTool,
   CHECK_TOOL_DEFINITION,
-];
+].map(({ name, description, inputSchema }) => ({ name, description, inputSchema }));
 
-// ── Config ────────────────────────────────────────────────────────────────────
+// ── Config + client ───────────────────────────────────────────────────────────
+// loadConfig throws with a plain message when a credential is missing, which is
+// the right failure: the server must not start half-authenticated.
 
-const BASE_URL = process.env.REFUELER_API_URL ?? 'https://api.share.refueler.io';
-const LIVE_KEY = process.env.REFUELER_LIVE_KEY ?? '';
-const SIGN_KEY = process.env.REFUELER_SIGN_KEY ?? '';
+const config = loadConfig();
+const api    = createApiClient(config);
+
+/** Deps object every handler receives. `api` is the name quote/balance/send use. */
+const deps = { api, apiClient: api, config };
 
 // ── Server bootstrap ──────────────────────────────────────────────────────────
 
@@ -74,34 +62,33 @@ const server = new Server(
   { capabilities: { tools: {} } },
 );
 
-const client = new ApiClient({ baseUrl: BASE_URL, liveKey: LIVE_KEY, signKey: SIGN_KEY, signRequest });
+server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
-// ── List tools ────────────────────────────────────────────────────────────────
-
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: TOOLS,
-}));
-
-// ── Call tool ─────────────────────────────────────────────────────────────────
+/** Normalise a handler's return value into an MCP tool result. */
+function toResult(value) {
+  if (Array.isArray(value))                  return { content: value };
+  if (value && Array.isArray(value.content)) return value;
+  return { content: [{ type: 'text', text: JSON.stringify(value) }] };
+}
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
   switch (name) {
     case 'refueler_capabilities':
-      return { content: await handleCapabilities(args, client) };
+      return toResult(await handleCapabilities(args, api));
 
     case 'refueler_quote':
-      return { content: await handleQuote(args, client) };
+      return toResult(await refuelerQuote(args, deps));
 
     case 'refueler_balance':
-      return { content: await handleBalance(args, client) };
+      return toResult(await refuelerBalance(args, deps));
 
     case 'refueler_send_file':
-      return { content: await handleSendFile(args, client) };
+      return toResult(await handleSendFile(args, deps));
 
     case 'refueler_check_transfer':
-      return { content: await handleCheckTransfer(args, client) };
+      return toResult(await handleCheckTransfer(args, api));
 
     default:
       throw new Error(`Unknown tool: ${name}`);
