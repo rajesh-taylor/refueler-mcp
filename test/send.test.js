@@ -33,6 +33,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import { handleSendFile, sendFileTool } from '../src/tools/send.js';
+import { _resetCache, _seedCache } from '../src/tools/capabilities.js';
 import { derivePartKey, decryptPart, blake3Chunk, CHUNK_SIZE } from '../src/crypto.js';
 import { buildMerkleTree } from '../src/merkle.js';
 import { parseFragment } from '../src/fragment.js';
@@ -478,6 +479,53 @@ describe('failures before anything is uploaded', () => {
     assert.equal(out.error, 'too_large');
     assert.equal(out.max_transfer_bytes, 1024);
     assert.equal(issued, false, 'no credential is issued for an over-cap file');
+  });
+
+  // src/index.js does NOT put a capabilities card in deps — it comes from the
+  // cache refueler_capabilities fills. These three pin the path production
+  // actually takes; the test above only pinned the injected one.
+  test('the cap also comes from the refueler_capabilities cache, with no deps card', async () => {
+    _resetCache();
+    _seedCache({ limits: { max_transfer_bytes: 1024 } });
+    try {
+      const { filePath } = await makeFile('bigcached.bin', 4096);
+      const harness = makeHarness();
+      let issued = false;
+      const result = await handleSendFile({ file_path: filePath }, {
+        api:             harness.api,
+        config:          TEST_CONFIG,
+        issueCredential: async () => { issued = true; return makeCredentialProvider()(); },
+        putPart:         harness.putPart,
+      });
+      const out = parse(result);
+      assert.equal(out.error, 'too_large');
+      assert.equal(out.max_transfer_bytes, 1024);
+      assert.equal(issued, false);
+      assert.equal(harness.calls.initiate.length, 0);
+    } finally {
+      _resetCache();
+    }
+  });
+
+  test('a deps card wins over the cache', async () => {
+    _resetCache();
+    _seedCache({ limits: { max_transfer_bytes: 1024 } });
+    try {
+      const { filePath } = await makeFile('depswins.bin', 4096);
+      const { out } = await send({ file_path: filePath }, {},
+        { capabilities: { limits: { max_transfer_bytes: 1024 * 1024 } } });
+      assert.equal(out.error, undefined, out.detail);
+    } finally {
+      _resetCache();
+    }
+  });
+
+  test('an empty cache and no deps card sends anyway — /initiate rules on the cap', async () => {
+    _resetCache();
+    const { filePath } = await makeFile('nocard.bin', 4096);
+    const { out, calls } = await send({ file_path: filePath });
+    assert.equal(out.error, undefined, out.detail);
+    assert.equal(calls.initiate.length, 1);
   });
 
   test('402 at credential issue returns the payment_required envelope, nothing uploaded', async () => {

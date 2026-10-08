@@ -33,6 +33,20 @@ export function _seedCache(value) {
   _cachedCapabilities = value;
 }
 
+/**
+ * cachedCapabilities() → the last good capabilities card, or null.
+ *
+ * Read-only; never fetches. The send tool uses this for its cap pre-check: if
+ * the agent has called refueler_capabilities at any point in this process —
+ * which the tool description tells it to do before a send — the card is here,
+ * and an over-cap file can be refused before a credential is issued. Null is
+ * the honest answer when nothing has been fetched, and the caller carries on
+ * without a local cap rather than guessing one; /initiate still enforces it.
+ */
+export function cachedCapabilities() {
+  return _cachedCapabilities;
+}
+
 // ---------------------------------------------------------------------------
 // Tool definition (MCP SDK schema)
 // ---------------------------------------------------------------------------

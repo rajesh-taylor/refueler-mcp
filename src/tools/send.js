@@ -49,6 +49,7 @@ import { buildMerkleTree, TREE_ALGO } from '../merkle.js';
 import { assembleFragment } from '../fragment.js';
 import { costCredits } from '../rate-card.js';
 import { putPresigned, RefuelerApiError } from '../api.js';
+import { cachedCapabilities } from './capabilities.js';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -272,7 +273,11 @@ export async function handleSendFile(input, deps = {}) {
   // Cap pre-check. /initiate checks the cap before the Cashu spend, so a 413 there
   // costs nothing at the Worker — but credential/issue has already taken a credit
   // from the pool by then. When the capabilities card is to hand, refuse first.
-  const capBytes = deps.capabilities?.limits?.max_transfer_bytes;
+  //
+  // The card comes from deps when a caller supplies one (tests, and any host that
+  // wants to pin it), otherwise from the in-process cache refueler_capabilities
+  // fills. Neither is guaranteed: with no card we send and let /initiate rule.
+  const capBytes = (deps.capabilities ?? cachedCapabilities())?.limits?.max_transfer_bytes;
   if (Number.isSafeInteger(capBytes) && capBytes > 0 && sizeBytes > capBytes) {
     return _mcpError('too_large',
       `This file is ${sizeBytes} bytes; the current per-transfer cap is ${capBytes} bytes.`,
