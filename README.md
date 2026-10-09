@@ -180,10 +180,11 @@ recipient has downloaded. These are *collection* receipts — they confirm
 collection, not delivery. Delivery to a specific person is not something the
 server can verify, and this product does not claim it.
 
-> **Receipts and webhooks are not live.** `GET /api/v1/capabilities` reports
-> `receipts: false` and `webhook: false`, and nothing fires today. Both return
-> to `true` at API-Repair-1, after a live test. Until then this tool will not
-> find a receipt to return. Scope your integration accordingly.
+> **Receipts need a registered webhook.** Receipts are signed with your
+> `rfs_whsec_`, which exists only once you register a webhook
+> (`POST /api/v1/webhook/register`). Without one there is no receipt to return.
+> Live since 9 Oct 2026 (Worker API-Repair-1); receipts are `refueler.receipt.v2`,
+> name your `org_account_id`, and only your own keys can pull them.
 
 **Gates on B7:** Anonymous-rail sends — where no identity is associated with
 the transfer and credits settle over Lightning — require the B7/NB-4

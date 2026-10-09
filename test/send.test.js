@@ -87,7 +87,7 @@ function makeHarness({
   const api = {
     async call(method, path, opts = {}) {
       if (path.endsWith('/initiate')) {
-        calls.initiate.push({ method, path, headers: opts.extraHeaders || {} });
+        calls.initiate.push({ method, path, auth: opts.auth === true, headers: opts.extraHeaders || {} });
         if (initiateStatus !== 200) {
           return { ok: false, status: initiateStatus, body: initiateBody, text: '' };
         }
@@ -262,6 +262,14 @@ describe('D-1 invariant and what never reaches the Worker', () => {
     const { filePath } = await makeFile('secret-report.pdf', 1234);
     const { calls } = await send({ file_path: filePath });
     assert.equal(calls.initiate[0].headers['X-File-Name'], 'encrypted-payload');
+  });
+
+  test('initiate is HMAC-signed and never names the client in a header (Worker API-Repair-1)', async () => {
+    const { filePath } = await makeFile('a.bin', 10);
+    const { calls } = await send({ file_path: filePath });
+    assert.equal(calls.initiate[0].auth, true);
+    assert.equal(calls.initiate[0].headers['X-Api-Live-Key'], undefined);
+    assert.ok(!JSON.stringify(calls.initiate[0].headers).includes(TEST_CONFIG.liveKey));
   });
 
   test('the real filename is in no request the Worker sees', async () => {

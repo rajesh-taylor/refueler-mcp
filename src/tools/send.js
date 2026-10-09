@@ -322,12 +322,15 @@ export async function handleSendFile(input, deps = {}) {
   if (destroy_after_download) initiateHeaders['X-Destroy-After-Download'] = '1';
   if (available_from)         initiateHeaders['X-Available-From']         = String(available_from);
   if (available_until)        initiateHeaders['X-Available-Until']        = String(available_until);
-  if (config?.liveKey)        initiateHeaders['X-Api-Live-Key']           = config.liveKey;
   if (transfer_ref)           initiateHeaders['X-Transfer-Ref']           = transfer_ref.slice(0, 128);
 
   let initRes;
   try {
-    initRes = await api.call('POST', `/upload/${uuid}/initiate`, { extraHeaders: initiateHeaders });
+    // HMAC-signed with the client's keys: the Worker takes the client (pool, receipts)
+    // from the signature only, never from a header (Worker API-Repair-1, 9 Oct 2026).
+    initRes = await api.call('POST', `/upload/${uuid}/initiate`, {
+      auth: Boolean(config?.liveKey), extraHeaders: initiateHeaders,
+    });
   } catch (e) {
     return _err(`Initiate failed: ${e.message}`);
   }
