@@ -232,7 +232,7 @@ describe('happy path — one part', () => {
     const { filePath } = await makeFile('url.bin', 2048);
     const { out } = await send({ file_path: filePath });
 
-    assert.ok(out.share_url.startsWith('https://refueler.io/share/?uuid='),
+    assert.ok(out.share_url.startsWith('https://share.refueler.io/?uuid='),
       `share_url must point at the live receiver: ${out.share_url}`);
     assert.ok(out.share_url.includes(`?uuid=${TEST_UUID}#`), 'uuid must precede the fragment');
 

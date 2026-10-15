@@ -10,7 +10,7 @@
 
 Refueler is a suite of Bitcoin-native privacy products built by Rajesh Taylor (solo founder, London). Operating within UK jurisdictional law. Not a fintech product. Not a loyalty app.
 
-**Products:** Share (anonymous encrypted file transfer, live at `refueler.io/share/`) · Legend (privacy-first Bitcoin block explorer, post-B9) · Merchant terminal (Fenchurch St line cafés and restaurants — tablet, counter/kitchen, landscape) · **Relay** (`io.refueler.merchant`, formerly NumoPay fork — in-venue order entry, Android phone, floor/waiter staff, portrait) · Refueler Pass (Lightning-native ticketing and venue access — own repo + Claude project) · **Refill** (consumer app, React Native, LNbits Lightning — commuter pre-orders + Legend + Pass)
+**Products:** Share (anonymous encrypted file transfer, live at `share.refueler.io` since 15 Oct 2026; landing page `refueler.io/share/`) · Legend (privacy-first Bitcoin block explorer, post-B9) · Merchant terminal (Fenchurch St line cafés and restaurants — tablet, counter/kitchen, landscape) · **Relay** (`io.refueler.merchant`, formerly NumoPay fork — in-venue order entry, Android phone, floor/waiter staff, portrait) · Refueler Pass (Lightning-native ticketing and venue access — own repo + Claude project) · **Refill** (consumer app, React Native, LNbits Lightning — commuter pre-orders + Legend + Pass)
 
 **Product names locked CC-103:** Floor staff Android app = Relay ("Relay by Refueler"). Consumer app = Refill.
 
@@ -33,8 +33,8 @@ Refueler is a suite of Bitcoin-native privacy products built by Rajesh Taylor (s
 ### Share boundary
 | `refueler-io` | `refueler-share` |
 |---|---|
-| All Nunjucks templates at `refueler.io/share/*` | Cloudflare Worker (`worker/src/index.js`), `wrangler.toml` |
-| `share-nav.njk`, `share-footer.njk`, `share.js`, `blake3/` | BLAKE3 source + build tooling |
+| refueler.io's own Share pages: landing `/share/`, Plans, Status, `share/forward.js` (old links, until 12 Jan 2027) | Cloudflare Worker (`worker/src/index.js`), `wrangler.toml` |
+| — | The app at `share.refueler.io` (`src/app/`, `frontend/`, `bin/ship-app.sh`; X5-2, 15 Oct 2026) + BLAKE3 source |
 | Admin dashboard pages `src/share/admin/` | Admin Worker endpoints |
 | Notes articles at `refueler.io/notes/` | `notes-articles-list.md` (editorial planning) |
 **MCP server boundary:** `refueler-mcp` is a separate repo (`/Users/rajeshtaylor/Documents/refueler-mcp/`). Runs in the agent's trust domain — not in `refueler-share`. Handles ciphertext only. Apache 2.0. One repo serves all Refueler products. SW-MCP-1 shipped `ab7e010` (12 Sep 2026).

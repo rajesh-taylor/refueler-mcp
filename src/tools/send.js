@@ -56,7 +56,7 @@ import { cachedCapabilities } from './capabilities.js';
 // ---------------------------------------------------------------------------
 
 /** The live receiver page. `?uuid=` is what loads the receiver card; `#` carries v2. */
-const SHARE_BASE_URL = 'https://refueler.io/share/';
+const SHARE_BASE_URL = 'https://share.refueler.io/';
 
 /**
  * Expiry requested at /initiate.
@@ -240,7 +240,7 @@ export async function handleSendFile(input, deps = {}) {
     return _mcpError(
       'not_supported',
       'A permanent record cannot be created from this server yet — the timestamp pipeline is browser-side. ' +
-      'Send without permanent_record, or make this transfer from refueler.io/share/.',
+      'Send without permanent_record, or make this transfer from share.refueler.io.',
     );
   }
 
@@ -574,7 +574,7 @@ function _paymentRequired(workerBody, costOfSend) {
       instructions:  rail === 'anonymous'
         ? 'Buy a credit block on the Refueler dashboard and add the credits to this server\'s local config.'
         : 'Request a credit top-up (or wait for your monthly reset) from your Refueler account.',
-      dashboard_url: 'https://refueler.io/share/',
+      dashboard_url: 'https://share.refueler.io/',
       offer:         null,
     },
   };
