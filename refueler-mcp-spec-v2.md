@@ -220,7 +220,6 @@ fragment is never transmitted to the Worker (§7.2 fragment grammar).
 | Payment required, account cancelled and period ended | 402 | `{ "error": "payment_required", "code": "account_cancelled", "payment": <§2.5> }` |
 | Payment required, anonymous stack empty / credit invalid | 402 / 400 | `{ "error": "payment_required", "code": "credit_invalid", "payment": <§2.5> }` |
 | Auth failed (bad HMAC / sign key) | 401 | `{ "error": "auth_failed", "detail": <string> }` |
-| MIME denied (execution-capable denylist) | 415 | `{ "error": "file_type_denied", "detail": <mime> }` |
 | Missing required manifest headers (internal bug) | 400 | `{ "error": "upload_rejected", "detail": <string> }` |
 | Chunk hash mismatch (BLAKE3) | 400 | `{ "error": "integrity_failed", "chunk": <n> }` — retries the chunk, then aborts |
 | Transfer already complete on resume | 409 | `{ "error": "already_complete", "uuid": <uuid> }` |
@@ -363,8 +362,8 @@ human receipt, authorship, or truth.
 ### 3.3 What the Worker can see — and never see
 
 **Can see:** ciphertext chunks; per-chunk and root **BLAKE3 hashes** (of ciphertext);
-byte counts; `uuid`; credential `commitment`; `expiry`; the declared Content-Type at
-the upload boundary (checked against an execution-capable denylist, **never stored**);
+byte counts; `uuid`; credential `commitment`; `expiry`; never the file type (no
+upload-time file-type check since Share-MIME-1, 16 Oct 2026);
 the `X-P2SH-Secret-Hash` (a hash, not the passphrase); API-tier `rfs_live_` handle +
 `transfer_ref`.
 
@@ -729,9 +728,8 @@ server's twin is `src/crypto.js`, gated on the same vectors in
   `download.js` attempts new-format parse first (base64url→JSON with `v`); on failure
   it falls back to the legacy raw-key fragment path. Remove the fallback once the
   longest possible legacy link (90-day) has expired.
-- **MIME/denylist unaffected:** the execution-capable denylist checks the declared
-  **Content-Type** at the upload boundary, not the filename extension — moving the
-  filename out of the Worker's sight changes nothing there.
+- **No file-type check:** retired (Share-MIME-1, 16 Oct 2026); the recipient's browser
+  notes a program after download. Nothing here depends on the type.
 - **Applies to both surfaces in the same session (decision 11):** SW-MCP-4 ships the
   MCP send tool and the consumer patch together; sync shared assets via
   `bin/sync-share.sh`.
