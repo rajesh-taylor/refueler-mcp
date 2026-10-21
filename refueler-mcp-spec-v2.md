@@ -90,7 +90,8 @@ Backing endpoints (all in the SW-block Worker, `api.share.refueler.io`):
 - `GET  /api/v1/auth/ping` — HMAC auth check; returns caller rail + quota.
 - `POST /api/v1/credential/issue` — HMAC-auth; spends 1 credit (identity) or one capability-atom credit (anonymous); returns a blind-signed upload credential bound to a fresh `uuid`.
 - `PUT  /upload/{uuid}/{NNNN}` — chunk upload; chunk `0000` carries manifest headers.
-- `GET  /api/v1/receipt/{uuid}/acceptance` and `/collection` — HMAC-auth; pull stored signed receipt.
+- `GET  /api/v1/receipt/acceptance` and `/collection` + `X-Transfer-UUID` — HMAC-auth; pull stored signed receipt.
+- **No transfer UUID in any path (UUID-Out-Of-Path-1 · 21 Oct 2026).** Every route that names a transfer is a fixed path and takes the UUID in `X-Transfer-UUID` (download part: `X-Part`). The HMAC canonical string is v2: `METHOD\nPATH\nTIMESTAMP\nBODY_HASH\nTRANSFER_UUID` (lower-case UUID, `""` when the request names none). Cloudflare's sampled request records keep IP + path, not headers.
 
 > **Route correction (carried):** live route regex is `(acceptance|collection)` —
 > not `accepted`. Webhook *event* names are `cargo.accepted` / `cargo.discharged`;
@@ -652,9 +653,9 @@ Notes locked:
   8 MiB "recommended" value with a 10 MiB ceiling described the retired Worker-relay
   chunk path; `max_chunk_bytes` is gone with it.
 - **The Worker-relay chunk PUT (`PUT /upload/:uuid/{NNNN}`) does not exist.** It was
-  retired at Share-6-6b. The upload sequence is `POST /upload/:uuid/initiate` →
-  presigned `PUT` **direct to R2** → `POST /upload/:uuid/urls` for further batches →
-  `POST /upload/:uuid/finalise` with the per-part digests and the ciphertext-chunk
+  retired at Share-6-6b. The upload sequence is `POST /upload/initiate` →
+  presigned `PUT` **direct to R2** → `POST /upload/urls` for further batches →
+  `POST /upload/finalise` (each with `X-Transfer-UUID`, UUID-Out-Of-Path-1) with the per-part digests and the ciphertext-chunk
   Merkle root. The tail part (N−1) is signed once, at `/initiate`, for its exact
   length; `/urls` never covers it. Finalise is not optional: without it there is no
   `{uuid}/hashes` sidecar and no `merkle_root`, and every download 409s, because the

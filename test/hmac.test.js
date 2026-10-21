@@ -51,16 +51,39 @@ describe('sha256Hex', () => {
 // buildCanonical
 // ---------------------------------------------------------------------------
 
+// v2 known answer (UUID-Out-Of-Path-1), computed with openssl dgst -sha256 -hmac rfs_sign_k
+const KAT_V2_SIG = '53efaa60599e96fc7ced824a99d6d0e4d9c8944ecb4e44c297ceef050ccaebc9';
+
 describe('buildCanonical', () => {
   test('produces the correct newline-delimited canonical string', () => {
     const canonical = buildCanonical('GET', '/api/v1/auth/ping', 1700000000, '');
     const parts = canonical.split('\n');
-    assert.equal(parts.length, 4);
+    assert.equal(parts.length, 5);   // v2: the transfer UUID line, '' here
     assert.equal(parts[0], 'GET');
     assert.equal(parts[1], '/api/v1/auth/ping');
     assert.equal(parts[2], '1700000000');
     // parts[3] = SHA-256('') 
     assert.equal(parts[3], 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855');
+    assert.equal(parts[4], '');
+  });
+
+  test('v2: the transfer UUID is the fifth line, lower-cased', () => {
+    const c = buildCanonical('GET', '/api/v1/receipt/acceptance', 1700000000, '', ' B1C2D3E4-F5A6-7890-ABCD-EF1234567890 ');
+    assert.equal(c, 'GET\n/api/v1/receipt/acceptance\n1700000000\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\nb1c2d3e4-f5a6-7890-abcd-ef1234567890');
+  });
+
+  test('v2 known answer: HMAC-SHA256 over the five-line string (Worker canonical)', () => {
+    // Expected sig computed independently: printf '%s' "$canonical" | openssl dgst -sha256 -hmac "$key"
+    const h = signRequest({ method: 'GET', path: '/api/v1/receipt/acceptance', liveKey: 'rfs_live_k', signKey: 'rfs_sign_k',
+      timestamp: 1700000000, transferUuid: 'b1c2d3e4-f5a6-7890-abcd-ef1234567890' });
+    assert.equal(h['Authorization'].match(/sig=([0-9a-f]{64})/)[1], KAT_V2_SIG);
+  });
+
+  test('a different transfer UUID gives a different signature', () => {
+    const base = { method: 'GET', path: '/api/v1/receipt/acceptance', liveKey: 'rfs_live_k', signKey: 'rfs_sign_k', timestamp: 1700000000 };
+    const a = signRequest({ ...base, transferUuid: 'b1c2d3e4-f5a6-7890-abcd-ef1234567890' })['Authorization'];
+    const b = signRequest({ ...base, transferUuid: '00000000-0000-4000-8000-000000000000' })['Authorization'];
+    assert.notEqual(a, b);
   });
 
   test('upcases the method', () => {

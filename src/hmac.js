@@ -3,8 +3,8 @@
  *
  * Signs every outbound authenticated API request.
  *
- * Canonical string:
- *   method + "\n" + path + "\n" + timestamp + "\n" + body_sha256_hex
+ * Canonical string (v2, UUID-Out-Of-Path-1 · 21 Oct 2026):
+ *   method + "\n" + path + "\n" + timestamp + "\n" + body_sha256_hex + "\n" + transfer_uuid
  *
  * Where:
  *   method    — uppercase HTTP verb, e.g. "GET"
@@ -12,6 +12,9 @@
  *   timestamp — Unix seconds as a decimal string
  *   body_sha256_hex — lowercase hex SHA-256 of the raw request body bytes;
  *                     empty body → SHA-256 of the empty string
+ *   transfer_uuid — the X-Transfer-UUID header, lower-case; "" when the request names
+ *                   no transfer. The UUID left the path (Cloudflare's sampled request
+ *                   records keep paths), so it is signed on its own line.
  *
  * Produces two headers:
  *   Authorization: HMAC-SHA256 key=<rfs_live_key>, ts=<timestamp>, sig=<hex>
@@ -40,11 +43,13 @@ export function sha256Hex(data) {
  * @param {string} path       — URL path + query string
  * @param {number} timestamp  — Unix seconds
  * @param {Buffer|string} body — raw request body (pass empty string for bodyless requests)
+ * @param {string} [transferUuid] — X-Transfer-UUID, or '' when the request names none
  * @returns {string}
  */
-export function buildCanonical(method, path, timestamp, body = '') {
+export function buildCanonical(method, path, timestamp, body = '', transferUuid = '') {
   const bodyHash = sha256Hex(body);
-  return `${method.toUpperCase()}\n${path}\n${timestamp}\n${bodyHash}`;
+  const uuidLine = String(transferUuid ?? '').trim().toLowerCase();
+  return `${method.toUpperCase()}\n${path}\n${timestamp}\n${bodyHash}\n${uuidLine}`;
 }
 
 /**
@@ -57,11 +62,12 @@ export function buildCanonical(method, path, timestamp, body = '') {
  * @param {string} opts.signKey    — rfs_sign_... request-signing key
  * @param {Buffer|string} [opts.body] — request body; defaults to empty string
  * @param {number} [opts.timestamp]   — Unix secs; defaults to Date.now() / 1000 | 0
+ * @param {string} [opts.transferUuid] — the X-Transfer-UUID the request carries, if any
  * @returns {{ Authorization: string, 'X-Api-Sign-Key': string, timestamp: number }}
  */
-export function signRequest({ method, path, liveKey, signKey, body = '', timestamp }) {
+export function signRequest({ method, path, liveKey, signKey, body = '', timestamp, transferUuid = '' }) {
   const ts = timestamp ?? (Date.now() / 1000 | 0);
-  const canonical = buildCanonical(method, path, ts, body);
+  const canonical = buildCanonical(method, path, ts, body, transferUuid);
   const sig = createHmac('sha256', signKey).update(canonical).digest('hex');
 
   return {

@@ -64,7 +64,7 @@ export function createApiClient(config, fetchImpl = fetch) {
     };
 
     if (auth) {
-      const hmacHeaders = signRequest({ method, path, liveKey, signKey, body });
+      const hmacHeaders = signRequest({ method, path, liveKey, signKey, body, transferUuid: extraHeaders['X-Transfer-UUID'] });
       headers['Authorization'] = hmacHeaders['Authorization'];
       headers['X-Api-Sign-Key'] = hmacHeaders['X-Api-Sign-Key'];
     }
@@ -161,7 +161,7 @@ export function createApiClient(config, fetchImpl = fetch) {
     if (body) headers['Content-Type'] = 'application/json';
 
     if (auth) {
-      const hmacHeaders = signRequest({ method, path, liveKey, signKey, body });
+      const hmacHeaders = signRequest({ method, path, liveKey, signKey, body, transferUuid: extraHeaders['X-Transfer-UUID'] });
       headers['Authorization']  = hmacHeaders['Authorization'];
       headers['X-Api-Sign-Key'] = hmacHeaders['X-Api-Sign-Key'];
     }
@@ -191,8 +191,8 @@ export function createApiClient(config, fetchImpl = fetch) {
    * get — non-throwing HMAC-signed GET. Returns { ok, status, body, text }.
    * Used by refueler_check_transfer, which reads 404 / 410 as answers.
    */
-  async function get(path) {
-    return call('GET', path, { auth: true });
+  async function get(path, extraHeaders = {}) {
+    return call('GET', path, { auth: true, extraHeaders });
   }
 
   return { getCapabilities, authPing, call, get };

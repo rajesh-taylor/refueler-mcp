@@ -9,8 +9,9 @@
  *   - state: "uploaded" | "collected" | "expired" | "unknown"
  *
  * Backing endpoints (api.share.refueler.io):
- *   GET /api/v1/receipt/{uuid}/acceptance   — HMAC-auth
- *   GET /api/v1/receipt/{uuid}/collection   — HMAC-auth
+ *   GET /api/v1/receipt/acceptance   — HMAC-auth, X-Transfer-UUID
+ *   GET /api/v1/receipt/collection   — HMAC-auth, X-Transfer-UUID
+ *   (UUID-Out-Of-Path-1: the transfer UUID is a signed header, never in the path.)
  *
  * Error matrix: auth_failed | not_found | rate_limited
  */
@@ -83,8 +84,8 @@ export function deriveState(acceptance, collection, expired = false) {
  * Throws a structured error for auth_failed, rate_limited, or unexpected status.
  */
 async function fetchReceipt(client, uuid, kind) {
-  const path = `/api/v1/receipt/${uuid}/${kind}`;
-  const result = await client.get(path);
+  const path = `/api/v1/receipt/${kind}`;
+  const result = await client.get(path, { 'X-Transfer-UUID': uuid });
 
   // 200 → return receipt object, or null if the Worker signals not-yet-collected
   // (body.receipt === null = honest "not yet" for collection; treat as absent)

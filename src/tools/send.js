@@ -7,13 +7,13 @@
  * Upload path (MCP-Fix-1 — direct-to-R2, the only path the Worker serves since
  * Share-6-6b retired the Worker-relay chunk PUT):
  *
- *   POST /upload/:uuid/initiate   headers only, no body → session token, the first
+ *   POST /upload/initiate   headers only, no body → session token, the first
  *                                 batch of presigned PutObject URLs, and the
  *                                 separately-signed tail URL for part N−1
  *   PUT  <presigned R2 URL>       each encrypted part, straight to R2 — the Worker
  *                                 is not in this path at all
- *   POST /upload/:uuid/urls       the next batch of URLs, session-token authed
- *   POST /upload/:uuid/finalise   per-part digests + the ciphertext Merkle root
+ *   POST /upload/urls             the next batch of URLs, session-token authed
+ *   POST /upload/finalise   per-part digests + the ciphertext Merkle root
  *
  * Invariants (see refueler-share CLAUDE.md locked decisions):
  *   - X-File-Name to the Worker is always the constant "encrypted-payload".
@@ -328,8 +328,9 @@ export async function handleSendFile(input, deps = {}) {
   try {
     // HMAC-signed with the client's keys: the Worker takes the client (pool, receipts)
     // from the signature only, never from a header (Worker API-Repair-1, 9 Oct 2026).
-    initRes = await api.call('POST', `/upload/${uuid}/initiate`, {
-      auth: Boolean(config?.liveKey), extraHeaders: initiateHeaders,
+    // UUID-Out-Of-Path-1: the UUID rides X-Transfer-UUID (signed, canonical v2), never the path.
+    initRes = await api.call('POST', '/upload/initiate', {
+      auth: Boolean(config?.liveKey), extraHeaders: { ...initiateHeaders, 'X-Transfer-UUID': uuid },
     });
   } catch (e) {
     return _err(`Initiate failed: ${e.message}`);
@@ -375,9 +376,9 @@ export async function handleSendFile(input, deps = {}) {
   const fullCount = totalChunks - 1;
 
   async function fetchUrlsFrom(from) {
-    const res = await api.call('POST', `/upload/${uuid}/urls`, {
+    const res = await api.call('POST', '/upload/urls', {
       body: JSON.stringify({ from, count: URL_BATCH_SIZE }),
-      extraHeaders: { 'X-Upload-Session': sessionToken },
+      extraHeaders: { 'X-Upload-Session': sessionToken, 'X-Transfer-UUID': uuid },
     });
     if (res.status === 401) {
       throw new SendStop('session_expired', 'The upload session expired or was already spent.');
@@ -474,12 +475,12 @@ export async function handleSendFile(input, deps = {}) {
   const { root } = buildMerkleTree(partHashes);
   let finRes;
   try {
-    finRes = await api.call('POST', `/upload/${uuid}/finalise`, {
+    finRes = await api.call('POST', '/upload/finalise', {
       body: JSON.stringify({
         hashes:      partHashes.map(toB64url),
         merkle_root: toB64url(root),
       }),
-      extraHeaders: { 'X-Upload-Session': sessionToken },
+      extraHeaders: { 'X-Upload-Session': sessionToken, 'X-Transfer-UUID': uuid },
     });
   } catch (e) {
     return _mcpError('finalise_failed',

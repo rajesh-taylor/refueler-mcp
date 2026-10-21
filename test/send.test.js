@@ -86,6 +86,7 @@ function makeHarness({
 
   const api = {
     async call(method, path, opts = {}) {
+      calls.paths = [...(calls.paths ?? []), { path, uuid: opts.extraHeaders?.['X-Transfer-UUID'] }];
       if (path.endsWith('/initiate')) {
         calls.initiate.push({ method, path, auth: opts.auth === true, headers: opts.extraHeaders || {} });
         if (initiateStatus !== 200) {
@@ -270,6 +271,17 @@ describe('D-1 invariant and what never reaches the Worker', () => {
     assert.equal(calls.initiate[0].auth, true);
     assert.equal(calls.initiate[0].headers['X-Api-Live-Key'], undefined);
     assert.ok(!JSON.stringify(calls.initiate[0].headers).includes(TEST_CONFIG.liveKey));
+  });
+
+  test('UUID-Out-Of-Path-1: fixed paths, the UUID only in X-Transfer-UUID', async () => {
+    const { filePath } = await makeFile('a.bin', 10);
+    const { calls } = await send({ file_path: filePath });
+    const sent = calls.paths.filter((c) => c.path.startsWith('/upload/'));
+    assert.deepEqual(sent.map((c) => c.path), ['/upload/initiate', '/upload/finalise']);
+    for (const c of sent) {
+      assert.match(c.uuid, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+      assert.ok(!/[0-9a-f]{8}-[0-9a-f]{4}-/.test(c.path));
+    }
   });
 
   test('the real filename is in no request the Worker sees', async () => {

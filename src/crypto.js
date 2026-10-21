@@ -159,7 +159,7 @@ export function blake3Chunk(chunkBuffer) {
 
 // NOTE: there is no blake3Root() here any more. The transfer's root is the
 // RFC 6962 unbalanced ciphertext-chunk Merkle root from src/merkle.js — that is
-// what POST /upload/:uuid/finalise records and what the Worker reconstructs
+// what POST /upload/finalise records and what the Worker reconstructs
 // before it serves a download. The old rolling concat-then-hash root matched
 // nothing the Worker reads.
 

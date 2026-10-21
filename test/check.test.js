@@ -38,8 +38,11 @@ import {
  */
 function mockClient(responses) {
   return {
-    async get(path) {
-      const key = `GET ${path}`;
+    async get(path, headers = {}) {
+      // UUID-Out-Of-Path-1: the transfer rides X-Transfer-UUID; the key names it as before.
+      assert.equal(headers['X-Transfer-UUID'], FAKE_UUID, 'receipt pull names the transfer in X-Transfer-UUID');
+      assert.ok(!path.includes(FAKE_UUID), 'no UUID in the path');
+      const key = `GET ${path.replace(/^\/api\/v1\/receipt\//, `/api/v1/receipt/${headers['X-Transfer-UUID']}/`)}`;
       if (!(key in responses)) {
         throw new Error(`Unexpected GET ${path}`);
       }
