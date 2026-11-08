@@ -19,3 +19,7 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+# Strategy docs live in the private repo; never commit them here
+REFUELER-BRIDGE.md
+refueler-mcp-spec-v2.md
