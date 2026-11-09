@@ -255,7 +255,7 @@ describe('cross-check: frontend/crypto.js decrypts an MCP-encrypted part', () =>
   });
 
   test('the two CHUNK_SIZE constants agree', { skip: !shareDir && 'REFUELER_SHARE_DIR not set' }, async () => {
-    const fe = await import(`${shareDir}/frontend/crypto.js`);
+    const fe = await import(`${shareDir}/frontend/config.js`);
     assert.equal(CHUNK_SIZE, fe.CHUNK_SIZE);
   });
 

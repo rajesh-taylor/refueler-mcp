@@ -195,7 +195,8 @@ export function createApiClient(config, fetchImpl = fetch) {
     return call('GET', path, { auth: true, extraHeaders });
   }
 
-  return { getCapabilities, authPing, call, get };
+  // quote.js and balance.js call api.ping().
+  return { getCapabilities, authPing, ping: authPing, call, get };
 }
 
 /**

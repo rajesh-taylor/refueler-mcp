@@ -4,7 +4,7 @@
  * All secrets are read from environment variables only.
  * Never from a file the operator might accidentally commit.
  *
- * Required:
+ * Optional, as a pair (fetch is free and keyless; every paid tool needs both):
  *   REFUELER_LIVE_KEY   — rfs_live_... identification key
  *   REFUELER_SIGN_KEY   — rfs_sign_... request-signing key
  *
@@ -12,19 +12,23 @@
  *   REFUELER_API_BASE   — defaults to https://api.share.refueler.io
  *   REFUELER_RAIL       — "identity" (default) | "anonymous" (post-B7)
  *   REFUELER_ANON_CREDITS — local JSON path to anonymous credit stack (post-B7, not functional in v1)
+ *   REFUELER_ROOT       — folder fetch may use when the client offers no roots
+ *   REFUELER_LINK_IN_CHAT — "1" lets refueler_fetch take the link as tool input.
+ *                         The model provider then receives the key. Operator only.
+ *   REFUELER_SANDBOX_HOST — one more host whose links fetch accepts (a test Worker)
  */
 
+const SHARE_HOST = 'share.refueler.io';
+
 export function loadConfig() {
-  const liveKey = process.env.REFUELER_LIVE_KEY;
-  const signKey = process.env.REFUELER_SIGN_KEY;
+  const liveKey = process.env.REFUELER_LIVE_KEY || null;
+  const signKey = process.env.REFUELER_SIGN_KEY || null;
 
-  const missing = [];
-  if (!liveKey) missing.push('REFUELER_LIVE_KEY');
-  if (!signKey) missing.push('REFUELER_SIGN_KEY');
-
-  if (missing.length > 0) {
+  // Neither key is a keyless server. One without the other is a mistake worth stopping for.
+  if (Boolean(liveKey) !== Boolean(signKey)) {
+    const missing = liveKey ? 'REFUELER_SIGN_KEY' : 'REFUELER_LIVE_KEY';
     throw new Error(
-      `Refueler MCP server cannot start — missing required environment variable(s): ${missing.join(', ')}.\n` +
+      `Refueler MCP server cannot start — ${missing} is missing. Set both API keys, or neither.\n` +
       `Set these in your environment or secrets manager before running the server.\n` +
       `Never write credential values into a file that could be committed to git.`
     );
@@ -47,13 +51,19 @@ export function loadConfig() {
     );
   }
 
+  const sandboxHost = process.env.REFUELER_SANDBOX_HOST || null;
+
   return {
     liveKey,
     signKey,
+    hasApiKeys: Boolean(liveKey),
     apiBase: (process.env.REFUELER_API_BASE ?? 'https://api.share.refueler.io').replace(/\/$/, ''),
     rail,
     // anonCreditsPath: local JSON path to the credit stack (post-B7, optional).
     // Operator places this file manually — never a `cp` from an automation tool.
     anonCreditsPath: process.env.REFUELER_ANON_CREDITS ?? null,
+    linkHosts: sandboxHost ? [SHARE_HOST, sandboxHost] : [SHARE_HOST],
+    linkInChat: process.env.REFUELER_LINK_IN_CHAT === '1',
+    rootEnv: process.env.REFUELER_ROOT || null,
   };
 }

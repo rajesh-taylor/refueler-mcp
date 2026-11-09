@@ -8,14 +8,18 @@
  *   refueler_balance        — SW-MCP-3
  *   refueler_send_file      — SW-MCP-4, rebuilt for the direct-to-R2 path at MCP-Fix-1
  *   refueler_check_transfer — SW-MCP-5
+ *   refueler_fetch          — MCP-Fetch-1 (free, keyless)
+ *   refueler_fetch_status   — MCP-Fetch-1
  *
  * Full path: /Users/rajeshtaylor/Documents/refueler-mcp/src/index.js
  * NOT refueler-share/worker/src/index.js — different repo entirely.
  *
- * The three tool modules return three different shapes (a full MCP result, a
- * content array, or a plain object). toResult() below normalises them, so a
- * handler can keep whichever shape its own tests pin.
+ * The tool modules return different shapes (a full MCP result, a content array,
+ * or a plain object). toResult() below normalises them, so a handler can keep
+ * whichever shape its own tests pin.
  */
+
+import { readFileSync } from 'node:fs';
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -26,6 +30,7 @@ import {
 
 import { createApiClient } from './api.js';
 import { loadConfig } from './config.js';
+import { createJobRunner } from './jobs.js';
 
 // ── Tool definitions + handlers ──────────────────────────────────────────────
 
@@ -34,6 +39,25 @@ import { quoteTool,         refuelerQuote }        from './tools/quote.js';
 import { balanceTool,       refuelerBalance }      from './tools/balance.js';
 import { sendFileTool,      handleSendFile }       from './tools/send.js';
 import { CHECK_TOOL_DEFINITION, handleCheckTransfer } from './tools/check.js';
+import {
+  fetchToolDefinition,
+  fetchStatusToolDefinition,
+  handleFetch,
+  handleFetchStatus,
+} from './tools/fetch.js';
+
+const { version } = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+
+// ── Config + client ───────────────────────────────────────────────────────────
+// loadConfig throws with a plain message on a half-set config. No keys at all is
+// a working server: fetch is free, and the paid tools say what they need.
+
+const config = loadConfig();
+const api    = createApiClient(config);
+const jobs   = createJobRunner();
+
+/** Deps object every handler receives. `api` is the name quote/balance/send use. */
+const deps = { api, apiClient: api, config };
 
 // ── Tool registry ─────────────────────────────────────────────────────────────
 
@@ -43,22 +67,22 @@ const TOOLS = [
   balanceTool,
   sendFileTool,
   CHECK_TOOL_DEFINITION,
+  fetchToolDefinition(config),
+  fetchStatusToolDefinition,
 ].map(({ name, description, inputSchema }) => ({ name, description, inputSchema }));
 
-// ── Config + client ───────────────────────────────────────────────────────────
-// loadConfig throws with a plain message when a credential is missing, which is
-// the right failure: the server must not start half-authenticated.
-
-const config = loadConfig();
-const api    = createApiClient(config);
-
-/** Deps object every handler receives. `api` is the name quote/balance/send use. */
-const deps = { api, apiClient: api, config };
+/** Every one of these signs its requests. */
+const NEEDS_API_KEYS = new Set([
+  'refueler_quote',
+  'refueler_balance',
+  'refueler_send_file',
+  'refueler_check_transfer',
+]);
 
 // ── Server bootstrap ──────────────────────────────────────────────────────────
 
 const server = new Server(
-  { name: 'refueler-mcp', version: '0.5.0' },
+  { name: 'refueler-mcp', version },
   { capabilities: { tools: {} } },
 );
 
@@ -71,8 +95,32 @@ function toResult(value) {
   return { content: [{ type: 'text', text: JSON.stringify(value) }] };
 }
 
+/** The client's folders, or null if it has none to offer. */
+async function clientRoots() {
+  if (!server.getClientCapabilities()?.roots) return null;
+  try {
+    const { roots } = await server.listRoots(undefined, { timeout: 5000 });
+    return roots.map(r => r.uri);
+  } catch {
+    return null;
+  }
+}
+
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
+
+  if (NEEDS_API_KEYS.has(name) && !config.hasApiKeys) {
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          error: 'api_keys_required',
+          detail: 'This tool needs REFUELER_LIVE_KEY and REFUELER_SIGN_KEY. refueler_fetch needs neither.',
+        }),
+      }],
+      isError: true,
+    };
+  }
 
   switch (name) {
     case 'refueler_capabilities':
@@ -90,10 +138,34 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     case 'refueler_check_transfer':
       return toResult(await handleCheckTransfer(args, api));
 
+    case 'refueler_fetch':
+      return handleFetch(args, { config, jobs, clientRoots });
+
+    case 'refueler_fetch_status':
+      return handleFetchStatus(args, { jobs });
+
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
 });
+
+// ── Stop ──────────────────────────────────────────────────────────────────────
+// Jobs end with the process, and leave no part file behind. A client going away
+// must not leave a fetch running with nobody to report to, least of all on a
+// link that works once.
+
+let stopping = false;
+async function stop() {
+  if (stopping) return;
+  stopping = true;
+  await jobs.abortAll();
+  process.exit(0);
+}
+
+process.stdin.on('end', stop);
+process.stdin.on('close', stop);
+process.on('SIGTERM', stop);
+process.on('SIGINT', stop);
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 
