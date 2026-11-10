@@ -10,6 +10,7 @@
  *   refueler_check_transfer — SW-MCP-5
  *   refueler_fetch          — MCP-Fetch-1 (free, keyless)
  *   refueler_fetch_status   — MCP-Fetch-1
+ *   refueler_send_status    — MCP-Install-1 (send runs on the job runner)
  *
  * Full path: /Users/rajeshtaylor/Documents/refueler-mcp/src/index.js
  * NOT refueler-share/worker/src/index.js — different repo entirely.
@@ -37,7 +38,7 @@ import { createJobRunner } from './jobs.js';
 import { capabilitiesTool,  handleCapabilities }   from './tools/capabilities.js';
 import { quoteTool,         refuelerQuote }        from './tools/quote.js';
 import { balanceTool,       refuelerBalance }      from './tools/balance.js';
-import { sendFileTool,      handleSendFile }       from './tools/send.js';
+import { sendFileTool }                           from './tools/send.js';
 import { CHECK_TOOL_DEFINITION, handleCheckTransfer } from './tools/check.js';
 import {
   fetchToolDefinition,
@@ -45,6 +46,7 @@ import {
   handleFetch,
   handleFetchStatus,
 } from './tools/fetch.js';
+import { sendStatusToolDefinition, handleSendJob, handleSendStatus } from './tools/send-job.js';
 
 const { version } = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 
@@ -61,6 +63,24 @@ const deps = { api, apiClient: api, config };
 
 // ── Tool registry ─────────────────────────────────────────────────────────────
 
+/**
+ * Tool annotations (MCP-Install-1). Hints for the client's UI, never a security
+ * control. fetch is marked destructive: on a link that works once, it causes the
+ * transfer's deletion. send spends credits, so it is not idempotent.
+ */
+const READ_REMOTE = { readOnlyHint: true, idempotentHint: true, openWorldHint: true };
+const READ_LOCAL  = { readOnlyHint: true, idempotentHint: true, openWorldHint: false };
+const ANNOTATIONS = {
+  refueler_capabilities:   { title: 'Share capabilities', ...READ_REMOTE },
+  refueler_quote:          { title: 'Quote a send', ...READ_REMOTE },
+  refueler_balance:        { title: 'Credit balance', ...READ_REMOTE },
+  refueler_send_file:      { title: 'Send a file', readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+  refueler_check_transfer: { title: 'Check a transfer', ...READ_REMOTE },
+  refueler_fetch:          { title: 'Fetch a Share link', readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+  refueler_fetch_status:   { title: 'Fetch progress', ...READ_LOCAL },
+  refueler_send_status:    { title: 'Send progress', ...READ_LOCAL },
+};
+
 const TOOLS = [
   capabilitiesTool,
   quoteTool,
@@ -69,7 +89,8 @@ const TOOLS = [
   CHECK_TOOL_DEFINITION,
   fetchToolDefinition(config),
   fetchStatusToolDefinition,
-].map(({ name, description, inputSchema }) => ({ name, description, inputSchema }));
+  sendStatusToolDefinition,
+].map(({ name, description, inputSchema }) => ({ name, description, inputSchema, annotations: ANNOTATIONS[name] }));
 
 /** Every one of these signs its requests. */
 const NEEDS_API_KEYS = new Set([
@@ -133,7 +154,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return toResult(await refuelerBalance(args, deps));
 
     case 'refueler_send_file':
-      return toResult(await handleSendFile(args, deps));
+      return handleSendJob(args, { ...deps, jobs });
 
     case 'refueler_check_transfer':
       return toResult(await handleCheckTransfer(args, api));
@@ -143,6 +164,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case 'refueler_fetch_status':
       return handleFetchStatus(args, { jobs });
+
+    case 'refueler_send_status':
+      return handleSendStatus(args, { jobs });
 
     default:
       throw new Error(`Unknown tool: ${name}`);

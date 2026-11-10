@@ -100,7 +100,8 @@ export const sendFileTool = {
   description:
     'Encrypt a local file and lodge it on Refueler Share. Returns a share URL whose ' +
     'fragment carries the transfer key, the real filename and the exact size — none of ' +
-    'which ever reaches the Worker. Cost is deducted from your credit pool.',
+    'which ever reaches the Worker. Cost is deducted from your credit pool. ' +
+    'A long send returns state "running" and a job_id for refueler_send_status; do not send again.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -209,6 +210,8 @@ export async function issueApiCredential({ api }) {
  * @param {Function} [deps.issueCredential] — credential provider; defaults to the
  *                                            HMAC API path. Injected by a soak run.
  * @param {Function} [deps.putPart]         — injectable presigned PUT (tests)
+ * @param {AbortSignal} [deps.signal]       — stops the send between parts (job runner)
+ * @param {Function} [deps.onProgress]      — (partsDone, partsTotal) after each part lands
  */
 export async function handleSendFile(input, deps = {}) {
   const {
@@ -216,6 +219,8 @@ export async function handleSendFile(input, deps = {}) {
     config,
     issueCredential = issueApiCredential,
     putPart = putPresigned,
+    signal,
+    onProgress = () => {},
   } = deps;
 
   const {
@@ -395,6 +400,8 @@ export async function handleSendFile(input, deps = {}) {
   // flight are held in memory (PARTS_IN_FLIGHT × 32 MiB), never the whole file.
   const partHashes = new Array(totalChunks);  // raw 32-byte ciphertext digests, in order
   const inFlight   = new Map();               // index → Promise
+  let partsDone    = 0;
+  onProgress(0, totalChunks);
 
   async function uploadOne(index, bytes, isLast) {
     const expectedLen = isLast
@@ -440,6 +447,9 @@ export async function handleSendFile(input, deps = {}) {
 
   try {
     for await (const { index, buffer } of chunkFile(resolvedPath, CHUNK_SIZE)) {
+      if (signal?.aborted) {
+        throw new SendStop('stopped', 'The send was stopped on this machine before it finished. Nothing is collectable.');
+      }
       if (index >= totalChunks) {
         throw new SendStop('file_changed', 'The file grew while it was being read.');
       }
@@ -451,7 +461,9 @@ export async function handleSendFile(input, deps = {}) {
 
       if (inFlight.size >= PARTS_IN_FLIGHT) await Promise.race(inFlight.values());
 
-      const p = uploadOne(index, ciphertext, isLast).finally(() => inFlight.delete(index));
+      const p = uploadOne(index, ciphertext, isLast)
+        .then(() => onProgress(++partsDone, totalChunks))
+        .finally(() => inFlight.delete(index));
       inFlight.set(index, p);
       // Surface a rejection at the next await rather than as an unhandled one.
       p.catch(() => {});

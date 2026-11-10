@@ -200,3 +200,23 @@ describe('fetch through the real server', () => {
     assert.equal((await readdir(dir)).filter(f => f.endsWith('.refueler-part')).length, 0);
   });
 });
+
+describe('tool annotations (MCP-Install-1)', () => {
+  test('every tool has a title and all four hints; fetch is marked destructive, send not idempotent', async () => {
+    const { client } = await connect();
+    const { tools } = await client.listTools();
+    assert.ok(tools.some(t => t.name === 'refueler_send_status'));
+    for (const t of tools) {
+      const a = t.annotations;
+      assert.ok(a?.title, `${t.name} has a title`);
+      for (const k of ['readOnlyHint', 'idempotentHint', 'openWorldHint']) {
+        assert.equal(typeof a[k], 'boolean', `${t.name}.${k}`);
+      }
+      if (!a.readOnlyHint) assert.equal(typeof a.destructiveHint, 'boolean', `${t.name}.destructiveHint`);
+    }
+    const by = Object.fromEntries(tools.map(t => [t.name, t.annotations]));
+    assert.equal(by.refueler_fetch.destructiveHint, true);
+    assert.equal(by.refueler_send_file.idempotentHint, false);
+    assert.equal(by.refueler_send_status.readOnlyHint, true);
+  });
+});

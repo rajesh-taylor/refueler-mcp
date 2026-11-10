@@ -232,7 +232,7 @@ async function download({ j, uuid, partKey, partsTotal: n, sizeBytes, dir, name,
 
 /** handleFetchStatus(input, deps) → MCP tool result */
 export function handleFetchStatus(input, { jobs }) {
-  const job = typeof input?.job_id === 'string' ? jobs.get(input.job_id) : undefined;
+  const job = typeof input?.job_id === 'string' ? jobs.get(input.job_id, 'fetch') : undefined;
   if (!job) {
     return toolResult({
       error: 'unknown_job',
