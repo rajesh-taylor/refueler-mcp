@@ -145,9 +145,23 @@ describe('folders', () => {
     assert.ok(isInside('/a/b/..c', '/a/b'), 'a name starting with dots is still inside');
   });
 
-  test('client roots come first', async () => {
+  test('client roots and REFUELER_ROOT together (MCP-Trust-1, decision B)', async () => {
     const roots = await allowedRoots({ clientRoots: [pathToFileURL(inside).href], rootEnv: other, cwd: other });
+    assert.deepEqual(roots, [inside, other]);
+  });
+
+  test('client roots alone when REFUELER_ROOT is unset; the start folder is not added', async () => {
+    const roots = await allowedRoots({ clientRoots: [pathToFileURL(inside).href], rootEnv: null, cwd: other });
     assert.deepEqual(roots, [inside]);
+  });
+
+  test('a missing REFUELER_ROOT beside working client roots is left out', async () => {
+    const roots = await allowedRoots({ clientRoots: [pathToFileURL(inside).href], rootEnv: path.join(base, 'nope'), cwd: other });
+    assert.deepEqual(roots, [inside]);
+  });
+
+  test('the refusal names REFUELER_ROOT', async () => {
+    await assert.rejects(() => folderInside(other, [inside]), (e) => /REFUELER_ROOT/.test(e.detail));
   });
 
   test('then REFUELER_ROOT', async () => {

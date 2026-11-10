@@ -32,7 +32,10 @@ import { writeFile, mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
-import { handleSendFile, sendFileTool } from '../src/tools/send.js';
+import { handleSendFile } from '../src/tools/send.js';
+import { sendToolDefinition } from '../src/tools/send-job.js';
+
+const sendFileTool = sendToolDefinition({});
 import { _resetCache, _seedCache } from '../src/tools/capabilities.js';
 import { derivePartKey, decryptPart, blake3Chunk, CHUNK_SIZE } from '../src/crypto.js';
 import { buildMerkleTree } from '../src/merkle.js';
@@ -195,8 +198,24 @@ describe('sendFileTool definition', () => {
     assert.equal(sendFileTool.inputSchema.properties.permanent_record, undefined);
   });
 
+  test('schema takes no password as input: password_file only (MCP-Trust-1)', () => {
+    assert.equal(sendFileTool.inputSchema.properties.passphrase, undefined);
+    assert.equal(sendFileTool.inputSchema.properties.password, undefined);
+    assert.ok(sendFileTool.inputSchema.properties.password_file);
+  });
+
+  test('accept_send is offered while confirmation is on, not when the operator turned it off', () => {
+    assert.ok(sendFileTool.inputSchema.properties.accept_send);
+    assert.equal(sendToolDefinition({ confirmSend: false }).inputSchema.properties.accept_send, undefined);
+  });
+
+  test('the description says the link stays out, unless link-in-chat is on', () => {
+    assert.match(sendFileTool.description, /never the link/);
+    assert.match(sendToolDefinition({ linkInChat: true }).description, /model provider receives the key/);
+  });
+
   test('description and schema never say sats, ecash or tokens', () => {
-    const text = JSON.stringify(sendFileTool).toLowerCase();
+    const text = JSON.stringify([sendFileTool, sendToolDefinition({ linkInChat: true })]).toLowerCase();
     for (const word of ['sats', 'ecash', 'tokens']) {
       assert.ok(!text.includes(word), `tool definition must not say "${word}"`);
     }

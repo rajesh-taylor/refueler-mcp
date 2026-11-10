@@ -13,7 +13,7 @@ import { FetchStop, OPEN_IN_BROWSER } from './stop.js';
 
 export const MAX_LINK_BYTES = 16 * 1024;
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const V2_KEYS = new Set(['v', 'k', 'n', 's', 'z']);
 
 const damaged = () => new FetchStop('link_damaged',

@@ -40,8 +40,10 @@ product is right for your threat model.
   nonce with a last-part flag, so no two parts are ever encrypted under the
   same key and nonce and a reordered, dropped or appended part fails its tag.
 - Puts the transfer key, the real filename and the exact plaintext size in
-  the returned `share_url` fragment only — never transmitted to the Refueler
-  Worker, never written to a log, never present in any request.
+  the link's fragment only — never transmitted to the Refueler Worker, never
+  written to a log, never present in any request. By default the link is
+  written to an owner-only file and kept out of the conversation, so the
+  model provider does not receive the key.
 - Computes a BLAKE3 hash over each ciphertext part and the Merkle root over
   those hashes, and hands both to the Worker when the upload is finalised.
 - Uploads each encrypted part directly to R2 under a URL the Worker signed
@@ -129,7 +131,15 @@ Environment variable names:
 REFUELER_LIVE_KEY=rfs_live_…
 REFUELER_SIGN_KEY=rfs_sign_…
 REFUELER_API_BASE=https://api.share.refueler.io
+REFUELER_ROOT=/path/to/a/folder      # optional: one more folder send and fetch may use
+REFUELER_LINK_DIR=~/.refueler/links  # optional: where links and passwords are written
+REFUELER_LINK_IN_CHAT=1              # optional: link in the result; the model provider then receives the key
+REFUELER_CONFIRM_SEND=0              # optional: no confirmation before a send (unattended use only)
 ```
+
+Send and fetch only touch files inside the client's folders (MCP roots) and
+`REFUELER_ROOT`; with neither, the folder the server started in, never your
+home folder or `/`.
 
 Use a `.env` file for local development or a secrets manager for
 production. Never commit key values to version control — the `rfs_live_`
@@ -169,10 +179,15 @@ No spend occurs.
 
 **`refueler_send_file`** — encrypt and send a file. Splits into 32 MiB parts,
 encrypts and BLAKE3-hashes each one locally, uploads them straight to R2
-under signed URLs, then finalises with the Merkle root. Returns a `share_url`
-carrying the transfer key, the real filename and the exact size in its
-fragment. Accepts an optional passphrase for a second access factor. Deducts
-credits from your pool on issuance.
+under signed URLs, then finalises with the Merkle root. The link (which
+carries the transfer key) goes to `<uuid>.link`, and any password to
+`<uuid>.password`, in the link folder (folder 0700, files 0600); the result
+gives their paths, the transfer ID and the expiry. A password comes from a
+local file (`password_file`), never as tool input. The user confirms each send:
+in a dialog where the client offers one, otherwise the agent asks and passes
+back a one-time `accept_send` code. Deducts credits from your pool on issuance.
+This keeps the key out of the default path to the model; an agent whose other
+tools may read the link folder can still read it.
 
 **`refueler_check_transfer`** — pull a signed receipt. The acceptance receipt
 is written when the transfer is finalised; the collection receipt once the

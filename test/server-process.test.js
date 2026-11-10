@@ -12,7 +12,7 @@ import path from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { ListRootsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { ElicitRequestSchema, ListRootsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { createFakeWorker, makeTransfer } from './helpers/fake-worker.js';
 
 const SERVER = fileURLToPath(new URL('../src/index.js', import.meta.url));
@@ -198,6 +198,67 @@ describe('fetch through the real server', () => {
     }
     assert.throws(() => process.kill(pid, 0));
     assert.equal((await readdir(dir)).filter(f => f.endsWith('.refueler-part')).length, 0);
+  });
+});
+
+describe('trust through the real server (MCP-Trust-1)', () => {
+  const keys = { REFUELER_LIVE_KEY: 'rfs_live_x', REFUELER_SIGN_KEY: 'rfs_sign_x', REFUELER_API_BASE: 'http://127.0.0.1:9' };
+
+  test('send outside the folders is refused before any request, naming REFUELER_ROOT', async () => {
+    const elsewhere = await realpath(await mkdtemp(path.join(os.tmpdir(), 'rf-else-')));
+    open.push(() => rm(elsewhere, { recursive: true, force: true }));
+    const f = path.join(elsewhere, 'x.txt');
+    await writeFile(f, 'x');
+    const { client } = await connect({ env: { ...keys, REFUELER_LINK_DIR: path.join(dir, 'links') } });
+    const v = parse(await client.callTool({ name: 'refueler_send_file', arguments: { file_path: f } }));
+    assert.equal(v.error, 'outside_allowed_folders');
+    assert.match(v.detail, /REFUELER_ROOT/);
+  });
+
+  test('without a dialog the send asks for a yes; with one, a no stops it', async () => {
+    const f = path.join(dir, 'x.txt');
+    await writeFile(f, 'hello');
+    const env = { ...keys, REFUELER_LINK_DIR: path.join(dir, 'links') };
+
+    const plain = await connect({ env });
+    const ask = parse(await plain.client.callTool({ name: 'refueler_send_file', arguments: { file_path: f } }));
+    assert.equal(ask.error, 'confirm_send');
+    assert.ok(ask.confirm_id);
+
+    let message;
+    const dialog = await connect({
+      env,
+      capabilities: { elicitation: { form: {} } },
+      setup: (c) => c.setRequestHandler(ElicitRequestSchema, async (req) => {
+        message = req.params.message;
+        return { action: 'decline' };
+      }),
+    });
+    const no = parse(await dialog.client.callTool({ name: 'refueler_send_file', arguments: { file_path: f } }));
+    assert.equal(no.error, 'send_declined');
+    assert.match(message, /x\.txt/);
+  });
+
+  test('REFUELER_CONFIRM_SEND=0 drops accept_send from the schema', async () => {
+    const { client } = await connect({ env: { REFUELER_CONFIRM_SEND: '0' } });
+    const { tools } = await client.listTools();
+    const send = tools.find(t => t.name === 'refueler_send_file');
+    assert.equal(send.inputSchema.properties.accept_send, undefined);
+    assert.equal(send.inputSchema.properties.passphrase, undefined);
+  });
+
+  test('fetch reads a link_file from the link folder even outside the roots, and never saves there', async () => {
+    const t = await makeTransfer();
+    const { apiBase } = await withWorker(t);
+    const links = await realpath(await mkdtemp(path.join(os.tmpdir(), 'rf-links-')));
+    open.push(() => rm(links, { recursive: true, force: true }));
+    const linkFile = path.join(links, 'in.link');
+    await writeFile(linkFile, t.link, { mode: 0o600 });
+
+    const { client } = await connect({ env: { REFUELER_API_BASE: apiBase, REFUELER_LINK_DIR: links, REFUELER_ROOT: dir } });
+    const v = parse(await client.callTool({ name: 'refueler_fetch', arguments: { link_file: linkFile, out_dir: dir } }));
+    assert.equal(v.state, 'complete');
+    assert.deepEqual(new Uint8Array(await readFile(v.path)), t.plain);
   });
 });
 

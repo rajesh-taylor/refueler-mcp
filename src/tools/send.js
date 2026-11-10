@@ -67,7 +67,7 @@ const SHARE_BASE_URL = 'https://share.refueler.io/';
  * anything longer, whatever the issued tier says. Raising this before B12-4a
  * ships would break every send.
  */
-const ENFORCED_EXPIRY_SECS = 7 * 24 * 3600;
+export const ENFORCED_EXPIRY_SECS = 7 * 24 * 3600;
 
 /** Parts in flight. Two, matching the browser after Safari-Slow-Link-1. */
 const PARTS_IN_FLIGHT = 2;
@@ -91,62 +91,9 @@ function toB64url(bytes) {
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-// ---------------------------------------------------------------------------
-// Tool schema
-// ---------------------------------------------------------------------------
-
-export const sendFileTool = {
-  name: 'refueler_send_file',
-  description:
-    'Encrypt a local file and lodge it on Refueler Share. Returns a share URL whose ' +
-    'fragment carries the transfer key, the real filename and the exact size — none of ' +
-    'which ever reaches the Worker. Cost is deducted from your credit pool. ' +
-    'A long send returns state "running" and a job_id for refueler_send_status; do not send again.',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      file_path: {
-        type: 'string',
-        description: 'Absolute or relative path to the file to send.',
-      },
-      recipient_hint: {
-        type: 'string',
-        description:
-          'Agent-side prose only (e.g. "Alice at Acme"). Never sent to the Worker or logged anywhere.',
-      },
-      passphrase: {
-        type: 'string',
-        description:
-          'Optional NUT-11 P2SH access gate. The recipient must supply this to collect. ' +
-          'Send it by a separate channel — never include it in the share URL.',
-      },
-      destroy_after_download: {
-        type: 'boolean',
-        description: 'If true, the transfer is deleted the moment it is collected.',
-      },
-      available_from: {
-        type: 'integer',
-        description: 'Unix timestamp (seconds) — unavailable before this time. Paid tiers only.',
-      },
-      available_until: {
-        type: 'integer',
-        description: 'Unix timestamp (seconds) — unavailable after this time. Paid tiers only.',
-      },
-      transfer_ref: {
-        type: 'string',
-        maxLength: 128,
-        description:
-          'Chartered-tier attribution reference (≤128 chars). Logged to Analytics Engine only. ' +
-          'Never stored in the manifest or shown to the recipient.',
-      },
-    },
-    required: ['file_path'],
-  },
-  handler: handleSendFile,
-};
-
-/** Back-compat alias for src/index.js's tool registry. */
-export const SEND_FILE_TOOL_DEFINITION = sendFileTool;
+// The tool's schema and its trust checks (folders, confirmation, link files)
+// live in send-job.js since MCP-Trust-1. This file is the send itself: it
+// returns share_url to its caller, and send-job.js keeps it out of the result.
 
 // ---------------------------------------------------------------------------
 // Credential provider — the production path
@@ -203,7 +150,9 @@ export async function issueApiCredential({ api }) {
 /**
  * handleSendFile(input, deps) → MCP content array
  *
- * @param {object}   input  — validated tool input per inputSchema
+ * @param {object}   input  — from send-job.js, after its checks. `passphrase` here is
+ *                            the password send-job.js read from password_file; the
+ *                            tool itself no longer takes one (MCP-Trust-1)
  * @param {object}   deps
  * @param {object}   deps.api               — API client (src/api.js createApiClient)
  * @param {object}   [deps.config]          — loaded config/secrets

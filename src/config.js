@@ -12,11 +12,19 @@
  *   REFUELER_API_BASE   — defaults to https://api.share.refueler.io
  *   REFUELER_RAIL       — "identity" (default) | "anonymous" (post-B7)
  *   REFUELER_ANON_CREDITS — local JSON path to anonymous credit stack (post-B7, not functional in v1)
- *   REFUELER_ROOT       — folder fetch may use when the client offers no roots
- *   REFUELER_LINK_IN_CHAT — "1" lets refueler_fetch take the link as tool input.
+ *   REFUELER_ROOT       — one more folder send and fetch may use, beside the client's roots
+ *   REFUELER_LINK_DIR   — where send writes <uuid>.link and <uuid>.password
+ *                         (default ~/.refueler/links; folder 0700, files 0600)
+ *   REFUELER_LINK_IN_CHAT — "1" puts share_url in send's result and lets
+ *                         refueler_fetch take the link as tool input.
  *                         The model provider then receives the key. Operator only.
+ *   REFUELER_CONFIRM_SEND — "0" turns off the user's confirmation before a send,
+ *                         for unattended use (CI, agent-to-agent). Operator only.
  *   REFUELER_SANDBOX_HOST — one more host whose links fetch accepts (a test Worker)
  */
+
+import path from 'node:path';
+import { DEFAULT_LINK_DIR } from './links.js';
 
 const SHARE_HOST = 'share.refueler.io';
 
@@ -65,5 +73,7 @@ export function loadConfig() {
     linkHosts: sandboxHost ? [SHARE_HOST, sandboxHost] : [SHARE_HOST],
     linkInChat: process.env.REFUELER_LINK_IN_CHAT === '1',
     rootEnv: process.env.REFUELER_ROOT || null,
+    linkDir: path.resolve(process.env.REFUELER_LINK_DIR || DEFAULT_LINK_DIR),
+    confirmSend: process.env.REFUELER_CONFIRM_SEND !== '0',
   };
 }

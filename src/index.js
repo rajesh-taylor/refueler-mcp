@@ -38,7 +38,6 @@ import { createJobRunner } from './jobs.js';
 import { capabilitiesTool,  handleCapabilities }   from './tools/capabilities.js';
 import { quoteTool,         refuelerQuote }        from './tools/quote.js';
 import { balanceTool,       refuelerBalance }      from './tools/balance.js';
-import { sendFileTool }                           from './tools/send.js';
 import { CHECK_TOOL_DEFINITION, handleCheckTransfer } from './tools/check.js';
 import {
   fetchToolDefinition,
@@ -46,7 +45,13 @@ import {
   handleFetch,
   handleFetchStatus,
 } from './tools/fetch.js';
-import { sendStatusToolDefinition, handleSendJob, handleSendStatus } from './tools/send-job.js';
+import {
+  sendToolDefinition,
+  sendStatusToolDefinition,
+  handleSendJob,
+  handleSendStatus,
+} from './tools/send-job.js';
+import { DIALOG_MS } from './confirm.js';
 
 const { version } = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 
@@ -85,7 +90,7 @@ const TOOLS = [
   capabilitiesTool,
   quoteTool,
   balanceTool,
-  sendFileTool,
+  sendToolDefinition(config),
   CHECK_TOOL_DEFINITION,
   fetchToolDefinition(config),
   fetchStatusToolDefinition,
@@ -127,6 +132,19 @@ async function clientRoots() {
   }
 }
 
+/**
+ * A dialog (form-mode elicitation) where the client offers one, else null.
+ * MCP-Install-1: Cursor and Copilot show them and keep the text from the model;
+ * Claude desktop offers none. Only file name, size, cost and expiry go in one.
+ */
+async function elicit(params) {
+  const caps = server.getClientCapabilities()?.elicitation;
+  if (!caps) return null;
+  // An empty object is the 2025-06-18 form of "form mode supported".
+  if (!caps.form && Object.keys(caps).length > 0) return null;
+  return server.elicitInput({ mode: 'form', ...params }, { timeout: DIALOG_MS });
+}
+
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
@@ -154,7 +172,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return toResult(await refuelerBalance(args, deps));
 
     case 'refueler_send_file':
-      return handleSendJob(args, { ...deps, jobs });
+      return handleSendJob(args, { ...deps, jobs, clientRoots, elicit });
 
     case 'refueler_check_transfer':
       return toResult(await handleCheckTransfer(args, api));

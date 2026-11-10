@@ -18,6 +18,7 @@ import { CHUNK_SIZE, decryptPart } from '../crypto.js';
 import { FetchStop, OPEN_IN_BROWSER, envelope } from '../fetch/stop.js';
 import { readLink, transferKeys } from '../fetch/link.js';
 import { allowedRoots, folderInside, readLinkFile } from '../fetch/folders.js';
+import { linkDirIfPresent } from '../links.js';
 import { cleanName, commitFile, openPartFile, writeAll } from '../fetch/files.js';
 import { checkDisk } from '../fetch/disk.js';
 import { eachPartInOrder, expectedPartBytes, fetchPart, getMeta, partsFromMeta } from '../fetch/transport.js';
@@ -37,7 +38,7 @@ export function fetchToolDefinition(config) {
   const properties = {
     link_file: {
       type: 'string',
-      description: 'Path to a local file holding the Share link. The link stays out of the conversation.',
+      description: 'Path to a local file holding the Share link, such as the link_file a send returned. The link stays out of the conversation.',
     },
     out_dir: {
       type: 'string',
@@ -128,8 +129,13 @@ async function startFetch(input, deps, keep) {
     rootEnv: config.rootEnv,
     cwd: deps.cwd,
   });
-  const dir = await folderInside(out_dir, roots);
-  const text = share_url !== undefined ? share_url : await readLinkFile(link_file, roots);
+  // The link folder is allowed for link_file, so a link a send saved can be fetched
+  // as it is; it is never a place to save into.
+  const linkDir = await linkDirIfPresent(config.linkDir);
+  const dir = await folderInside(out_dir, roots, { notIn: linkDir ? [linkDir] : [] });
+  const text = share_url !== undefined
+    ? share_url
+    : await readLinkFile(link_file, linkDir ? [...roots, linkDir] : roots);
 
   const link = readLink(text, { hosts: config.linkHosts });
   keep(link);
